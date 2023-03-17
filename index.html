@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+<head>
+		<title>Game Selector</title>
+		<style>
+			.header {
+				background-color: black;
+				border: 2px solid blue;
+				color: white;
+				text-align: center;
+				padding: 10px;
+			}
+			.dropdown {
+				position: relative;
+				display: inline-block;
+			}
+			.dropdown-content {
+				display: none;
+				position: absolute;
+				background-color: #f9f9f9;
+				min-width: 160px;
+				box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+				z-index: 1;
+			}
+			.dropdown:hover .dropdown-content {
+				display: block;
+			}
+			.dropdown-content a {
+				color: black;
+				padding: 12px 16px;
+				text-decoration: none;
+				display: block;
+			}
+			.dropdown-content a:hover {
+				background-color: #f1f1f1;
+			}
+		</style>
+	</head>
+		<div class="header">
+			<div class="dropdown">
+				<button class="dropbtn">Select a Game</button>
+				<div class="dropdown-content">
+					<a href="index.html">Maze</a>
+					<a href="index2.html">Unfair Pong</a>
+					<a href="index3.html">Dodging Rain</a>
+					<a href="index4.html">Catch a Rain Drop</a>
+				</div>
+			</div>
+		</div>
+</head>
+	<title>Random Maze Game</title>
+	<style>
+		#maze-container {
+			position: relative;
+			width: 400px;
+			height: 400px;
+			background-color: #eee;
+			margin: 50px auto;
+		}
+
+		.wall {
+			position: absolute;
+			background-color: #333;
+		}
+
+		#start {
+			position: absolute;
+			width: 20px;
+			height: 20px;
+			background-color: red;
+			border-radius: 50%;
+			top: 0;
+			left: 0;
+			cursor: move;
+		}
+
+		#finish {
+			position: absolute;
+			width: 20px;
+			height: 20px;
+			background-color: blue;
+			border-radius: 50%;
+			bottom: 0;
+			right: 0;
+		}
+	</style>
+<body>
+
+<div id="maze-container"></div>
+
+<script>
+	// Maze dimensions
+	const width = 20;
+	const height = 20;
+
+	// Create 2D array to represent maze
+	let maze = new Array(height);
+	// Generate maze randomly
+	var generating = true;
+	while(generating) {
+		for (let i = 0; i < maze.length; i++) {
+			maze[i] = new Array(width).fill(false);
+		}
+		for (let i = 0; i < height; i++) {
+			for (let j = 0; j < width; j++) {
+				if (Math.random() < 0.3) {
+					maze[i][j] = true;
+				}
+			}
+		}
+		maze[0][0] = false;
+		if (isSolvable(maze)) {
+			generating = false;
+		}
+	}
+
+	// Draw maze walls
+	const container = document.getElementById("maze-container");
+	for (let i = 0; i < height; i++) {
+		for (let j = 0; j < width; j++) {
+			if (maze[i][j]) {
+				const wall = document.createElement("div");
+				wall.className = "wall";
+				wall.style.top = i * 20 + "px";
+				wall.style.left = j * 20 + "px";
+				wall.style.width = "20px";
+				wall.style.height = "20px";
+				container.appendChild(wall);
+			}
+		}
+	}
+
+	// Add start and finish dots
+	const start = document.createElement("div");
+	start.id = "start";
+	container.appendChild(start);
+	var startX = start.offsetLeft;
+	var startY = start.offsetTop;
+  	var tolerance = 2;
+	const finish = document.createElement("div");
+	finish.id = "finish";
+	container.appendChild(finish);
+
+	// Move start dot with mouse
+	start.addEventListener("mousemove", (event) => {
+		const x = event.clientX - container.offsetLeft - start.offsetWidth / 2;
+		const y = event.clientY - container.offsetTop - start.offsetHeight / 2;
+		if (x >= 0 && y >= 0 && x <= container.offsetWidth - start.offsetWidth && y <= container.offsetHeight - start.offsetHeight) {
+			start.style.left = x + "px";
+			start.style.top = y + "px";
+
+			// Check for collision with walls
+			const startRect = start.getBoundingClientRect();
+			const walls = document.getElementsByClassName("wall");
+			for (let i = 0; i < walls.length; i++) {
+				const wallRect = walls[i].getBoundingClientRect();
+				if (startRect.left + tolerance < wallRect.right && startRect.right - tolerance > wallRect.left && startRect.top + tolerance < wallRect.bottom && startRect.bottom - tolerance > wallRect.top) {
+					reset();
+					break;
+				}
+			}
+
+			// Check for reaching finish
+			const finishRect = finish.getBoundingClientRect();
+			if (startRect.left < finishRect.right && startRect.right > finishRect.left && startRect.top < finishRect.bottom && startRect.bottom > finishRect.top)
+			{
+				alert("You win!");
+			}
+		}
+	});
+
+var currentX = start.offsetLeft;
+var currentY = start.offsetTop;
+
+function checkCollision() {
+  var collided = false;
+  var walls = document.getElementsByClassName("wall");
+  for (var i = 0; i < walls.length; i++) {
+    var wall = walls[i];
+    if (currentX + tolerance < wall.offsetLeft + wall.offsetWidth &&
+        currentX + start.offsetWidth - tolerance > wall.offsetLeft &&
+        currentY + tolerance < wall.offsetTop + wall.offsetHeight &&
+        currentY + start.offsetHeight - tolerance > wall.offsetTop) {
+      collided = true;
+      break;
+    }
+  }
+  if (collided) {
+    reset();
+  }
+  if (currentX == finish.offsetLeft && currentY == finish.offsetTop) {
+    alert("You win!");
+    reset();
+  }
+}
+
+function moveDot(event) {
+  var newX = currentX + event.movementX;
+  var newY = currentY + event.movementY;
+  if (newX >= maze.offsetLeft && newX + start.offsetWidth <= maze.offsetLeft + maze.offsetWidth) {
+    currentX = newX;
+    start.style.left = currentX + "px";
+  }
+  if (newY >= maze.offsetTop && newY + start.offsetHeight <= maze.offsetTop + maze.offsetHeight) {
+    currentY = newY;
+    start.style.top = currentY + "px";
+  }
+  checkCollision();
+}
+
+function reset() {
+  start.style.left = startX + "px";
+  start.style.top = startY + "px";
+}
+
+function isSolvable(maze) {
+  // Starting position is the upper left corner of the maze
+  let startRow = 0;
+  let startCol = 0;
+  
+  // Ending position is the lower right corner of the maze
+  let endRow = maze.length - 1;
+  let endCol = maze[0].length - 1;
+
+  // Create a stack to keep track of the visited cells
+  let stack = [];
+  let visited = new Set();
+  stack.push([startRow, startCol]);
+  
+  // Keep iterating while there are cells to visit
+  while (stack.length > 0) {
+    let [currRow, currCol] = stack.pop();
+    
+    // If the current cell is the end cell, return true
+    if (currRow === endRow && currCol === endCol) {
+      return true;
+    }
+    
+    // Mark the current cell as visited
+    visited.add(`${currRow},${currCol}`);
+    
+    // Check adjacent cells (up, down, left, right)
+    let adjacentCells = [[currRow-1, currCol], [currRow+1, currCol], [currRow, currCol-1], [currRow, currCol+1]];
+    
+    for (let [adjRow, adjCol] of adjacentCells) {
+      // If the adjacent cell is within the bounds of the maze
+      // and is not a wall and has not been visited yet, add it to the stack
+      if (adjRow >= 0 && adjRow < maze.length &&
+          adjCol >= 0 && adjCol < maze[0].length &&
+          !maze[adjRow][adjCol] && !visited.has(`${adjRow},${adjCol}`)) {
+        stack.push([adjRow, adjCol]);
+      }
+    }
+  }
+  
+  // If we have visited all cells and haven't found the end cell, return false
+  return false;
+}
+
+document.addEventListener("mousemove", moveDot);
+
+</script>

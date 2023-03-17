@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html>
+<head>
+<head>
+    <title>Game Selector</title>
+    <style>
+      .header {
+        background-color: black;
+        border: 2px solid blue;
+        color: white;
+        text-align: center;
+        padding: 10px;
+      }
+      .dropdown {
+        position: relative;
+        display: inline-block;
+      }
+      .dropdown-content {
+        display: none;
+        position: absolute;
+        background-color: #f9f9f9;
+        min-width: 160px;
+        box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+        z-index: 1;
+      }
+      .dropdown:hover .dropdown-content {
+        display: block;
+      }
+      .dropdown-content a {
+        color: black;
+        padding: 12px 16px;
+        text-decoration: none;
+        display: block;
+      }
+      .dropdown-content a:hover {
+        background-color: #f1f1f1;
+      }
+    </style>
+  </head>
+    <div class="header">
+      <div class="dropdown">
+        <button class="dropbtn">Select a Game</button>
+        <div class="dropdown-content">
+          <a href="index.html">Maze</a>
+          <a href="index2.html">Unfair Pong</a>
+          <a href="index3.html">Dodging Rain</a>
+          <a href="index4.html">Catch a Rain Drop</a>
+        </div>
+      </div>
+    </div>
+</head>
+    <meta charset="utf-8" />
+    <title>Pong Game</title>
+    <style>
+      canvas {
+        border: 1px solid black;
+      }
+    </style>
+  <body>
+    <canvas id="canvas" width="800" height="600"></canvas>
+    <script>
+      // Set up canvas
+      var canvas = document.getElementById("canvas");
+      var ctx = canvas.getContext("2d");
+
+      // Set up game variables
+      var balls = [
+        {
+          x: canvas.width / 2,
+          y: canvas.height / 2,
+          radius: 10,
+          dx: 5,
+          dy: -5
+        },
+        {
+          x: canvas.width / 2,
+          y: canvas.height / 2,
+          radius: 10,
+          dx: -2,
+          dy: 5
+        }
+      ];
+      var paddle = {
+        x: canvas.width / 2 - 50,
+        y: canvas.height - 20,
+        width: 100,
+        height: 10,
+        dx: 0
+      };
+      var score = 0;
+      var obstacles = [];
+      // Function to create random obstacles
+      function createObstacle() {
+        var obstacle = {
+          x: Math.random() * (canvas.width - 50),
+          y: -20,
+          width: 50,
+          height: 20,
+          visible: true
+        };
+        obstacles.push(obstacle);
+      }
+
+      // Event to create obstacles every 5 seconds
+      setInterval(createObstacle, 1000);
+
+      // Function to detect collision between ball and obstacle
+      function ballObstacleCollision(ball, obstacle) {
+        if (
+          ball.x + ball.radius > obstacle.x &&
+          ball.x - ball.radius < obstacle.x + obstacle.width &&
+          ball.y + ball.radius > obstacle.y &&
+          ball.y - ball.radius < obstacle.y + obstacle.height
+        ) {
+          obstacle.visible = false;
+          ball.dy = -ball.dy;
+        }
+      }
+
+      // Function to draw obstacles
+      function drawObstacles() {
+        obstacles.forEach(function(obstacle) {
+          if (obstacle.visible) {
+            ctx.beginPath();
+            ctx.rect(obstacle.x, obstacle.y, obstacle.width, obstacle.height);
+            ctx.fillStyle = "red";
+            ctx.fill();
+            ctx.closePath();
+          }
+        });
+      }
+
+      // Function to detect collision between ball and obstacles
+      function detectBallObstacleCollisions() {
+        balls.forEach(function(ball) {
+          obstacles.forEach(function(obstacle) {
+            if (obstacle.visible) {
+              ballObstacleCollision(ball, obstacle);
+            }
+          });
+        });
+      }
+
+      // Move obstacles
+      function moveObstacles() {
+        obstacles.forEach(function(obstacle) {
+          if (obstacle.visible) {
+            obstacle.y += 5;
+          }
+        });
+      }
+
+      // Draw ball
+      function drawBall(ball) {
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+        ctx.fillStyle = "black";
+        ctx.fill();
+        ctx.closePath();
+        moveObstacles();
+        drawObstacles();
+        detectBallObstacleCollisions();        
+      }
+
+      // Draw paddle
+      function drawPaddle() {
+        ctx.beginPath();
+        ctx.rect(paddle.x, paddle.y, paddle.width, paddle.height);
+        ctx.fillStyle = "black";
+        ctx.fill();
+        ctx.closePath();
+      }
+
+      // Draw score
+      function drawScore() {
+        ctx.font = "16px Arial";
+        ctx.fillStyle = "black";
+        ctx.fillText("Score: " + score, 10, 20);
+      }
+
+      // Detect collision with walls
+      function wallCollision(ball) {
+        if (ball.x + ball.dx > canvas.width - ball.radius || ball.x + ball.dx < ball.radius) {
+          ball.dx = -ball.dx;
+        }
+        if (ball.y + ball.dy < ball.radius) {
+          ball.dy = -ball.dy;
+        } else if (ball.y + ball.dy > canvas.height - ball.radius) {
+          if (ball.x > paddle.x && ball.x < paddle.x + paddle.width) {
+            paddleCollision(ball)
+            ball.dy = -ball.dy;
+            score++;
+          } else {
+            // Game over
+            alert("Game Over!");
+            document.location.reload();
+          }
+        }
+      }
+      function paddleCollision(ball) {
+        if (
+          ball.x > paddle.x &&
+          ball.x < paddle.x + paddle.width &&
+          ball.y + ball.dy > canvas.height - ball.radius - paddle.height
+        ) {
+          // Calculate position of ball hit on the paddle
+          var ballHitPosition = ball.x - (paddle.x + paddle.width / 2);
+          var relativePosition = ballHitPosition / (paddle.width / 2);
+          
+          // Calculate angle adjustment
+          var angleAdjustment = relativePosition * 0.2; // Adjust this factor as needed
+          
+          // Adjust ball's horizontal velocity (dx) based on position of ball hit on paddle
+          ball.dx += angleAdjustment;
+        }
+      }
+
+
+      // Move paddle
+      function movePaddle() {
+        paddle.x += paddle.dx;
+        if (paddle.x < 0) {
+          paddle.x = 0;
+        } else if (paddle.x + paddle.width > canvas.width) {
+          paddle.x = canvas.width - paddle.width;
+        }
+      }
+
+      function movePaddleWithMouse(event) {
+        // Get horizontal position of mouse relative to canvas
+        var mouseX = event.clientX - canvas.offsetLeft;
+        
+        // If mouse is within the bounds of the canvas, move the paddle to the horizontal position of the mouse
+        if (mouseX > paddle.width / 2 && mouseX < canvas.width - paddle.width / 2) {
+          paddle.x = mouseX - paddle.width / 2;
+        }
+      }
+      document.addEventListener("mousemove", movePaddleWithMouse);
+
+      // Draw everything
+      function draw() {
+        // Clear canvas
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Draw balls and paddle
+        balls.forEach(function(ball) {
+          drawBall(ball);
+        });
+        drawPaddle();
+
+        // Draw score
+        drawScore();
+
+        // Detect wall collision
+        balls.forEach(function(ball) {
+          wallCollision(ball);
+        });
+
+        // Move paddle
+        movePaddle();
+
+        // Move balls
+        balls.forEach(function(ball) {
+          ball.x += ball.dx;
+          ball.y += ball.dy;
+        });
+
+        // Request next frame
+        requestAnimationFrame(draw);
+      }
+
+      // Event listeners
+      document.addEventListener("keydown", function(event) {
+        if (event.key === "ArrowLeft") {
+          paddle.dx = -5;
+        } else if (event.key === "ArrowRight") {
+          paddle.dx = 5;
+        }
+      });
+
+      document.addEventListener("keyup", function(event) {
+        if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+          paddle.dx = 0;
+        }
+      });
+
+      // Start game
+      draw();
+    </script>
+  </body>
+</html>
+

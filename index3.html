@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+<head>
+    <title>Game Selector</title>
+    <style>
+      .header {
+        background-color: black;
+        color: white;
+        text-align: center;
+        padding: 10px;
+      }
+      .dropdown {
+        position: relative;
+        display: inline-block;
+      }
+      .dropdown-content {
+        display: none;
+        position: absolute;
+        background-color: #f9f9f9;
+        min-width: 160px;
+        box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+        z-index: 1;
+      }
+      .dropdown:hover .dropdown-content {
+        display: block;
+      }
+      .dropdown-content a {
+        color: black;
+        padding: 12px 16px;
+        text-decoration: none;
+        display: block;
+      }
+      .dropdown-content a:hover {
+        background-color: #f1f1f1;
+      }
+    </style>
+  </head>
+    <div class="header">
+      <div class="dropdown">
+        <button class="dropbtn">Select a Game</button>
+        <div class="dropdown-content">
+          <a href="index.html">Maze</a>
+          <a href="index2.html">Unfair Pong</a>
+          <a href="index3.html">Dodging Rain</a>
+          <a href="index4.html">Catch a Rain Drop</a>
+        </div>
+      </div>
+    </div>
+</head>
+    <meta charset="UTF-8">
+    <title>Raining ASCII Animation</title>
+    <style>
+      /* CSS styles for the animation */
+      body {
+        background-color: #000000;
+        overflow: hidden;
+      }
+      .rain {
+        color: #ffffff;
+        position: absolute;
+        top: -20px;
+        font-size: 20px;
+        animation: raindrop 2s linear;
+      }
+      @keyframes raindrop {
+        0% {
+          top: -20px;
+        }
+        100% {
+          top: 100%;
+        }
+      }
+      #counter {
+        position: absolute;
+        top: 0;
+        right: 0;
+        color: red;
+        font-size: 24px;
+      }
+      #player {
+        position: absolute;
+        bottom: 0;
+        color: blue;
+        font-size: 20px;
+        width: 20px;
+        text-align: center;
+        pointer-events: none;
+      }
+      .bullet {
+        position: absolute;
+        color: red;
+        font-size: 20px;
+        width: 5px;
+        height: 20px;
+        background-color: red;
+        pointer-events: none;
+      }
+    </style>
+  <body>
+    <div id="counter">0</div>
+    <div id="player">A</div>
+    <script>
+      alert("Move the character at the bottom and shoot at rain drops with space bar!");
+      // JavaScript code for the animation
+      const asciiChars = "!@#$%^&*()-_=+[]{}|;:',.<>/?`~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const numChars = asciiChars.length;
+      const player = document.getElementById("player");
+      const bulletSpeed = 10;
+      let score = 0;
+      let bulletY = null;
+      let bulletTimer = null;
+      
+      function movePlayer(dx) {
+        const rect = player.getBoundingClientRect();
+        const newLeft = rect.left + dx;
+        if (newLeft >= 0 && newLeft + rect.width <= window.innerWidth) {
+          player.style.left = newLeft + "px";
+          checkCollision();
+        }
+      }
+      
+  function createBullet() {
+    if (bulletY === null) {
+      bulletY = player.offsetTop;
+      const bullet = document.createElement("div");
+      bullet.classList.add("bullet");
+      bullet.style.left = (player.offsetLeft + player.offsetWidth / 2) + "px";
+      bullet.style.top = bulletY + "px";
+      document.body.appendChild(bullet);
+      bulletTimer = setInterval(() => {
+        bulletY -= bulletSpeed;
+        bullet.style.top = bulletY + "px";
+        if (bulletY <= 0) {
+          bullet.remove();
+          bulletY = null;
+          clearInterval(bulletTimer);
+        } else {
+          const bulletRect = bullet.getBoundingClientRect();
+          const rains = document.querySelectorAll(".rain");
+          rains.forEach(rain => {
+            const rainRect = rain.getBoundingClientRect();
+            if (
+              bulletRect.right >= rainRect.left - 2 &&
+              bulletRect.left <= rainRect.right + 2 &&
+              bulletRect.bottom >= rainRect.top - 2 &&
+              bulletRect.top <= rainRect.bottom + 2
+            ) {
+              rain.remove();
+              score += 1;
+              document.getElementById("counter").textContent = score;
+            }
+          });
+        }
+      }, 10);
+    }
+  }
+  function checkCollision() {
+    const playerRect = player.getBoundingClientRect();
+    const rains = document.querySelectorAll(".rain");
+    for (let i = 0; i < rains.length; i++) {
+      const rainRect = rains[i].getBoundingClientRect();
+      if (
+        playerRect.left < rainRect.right + 5 &&
+        playerRect.right > rainRect.left - 5 &&
+        playerRect.top < rainRect.bottom &&
+        playerRect.bottom > rainRect.top
+      ) {
+        // Collision detected
+        alert("Game Over!");
+        score = 0;
+        document.getElementById("counter").textContent = score;
+        break;
+      }
+    }
+  }
+
+
+  let speed = 1;
+  let maxSpeed = 20;
+  let acceleration = 1;
+
+  function handleKeyDown(event) {
+    if (event.key === "ArrowLeft" || event.key === "a") {
+      movePlayer(-speed);
+    } else if (event.key === "ArrowRight" || event.key === "s") {
+      movePlayer(speed);
+    } else if (event.key === " " || event.key === "Enter") {
+      createBullet();
+    }
+    
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "a" || event.key === "s") {
+      speed = Math.min(speed + acceleration, maxSpeed);
+    }
+  }
+
+  function handleKeyUp(event) {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "a" || event.key === "s") {
+      speed = 1;
+    }
+  }
+  document.addEventListener("keyup", handleKeyUp);
+  
+  function handleMouseMove(event) {
+    const mouseX = event.clientX;
+    const playerWidth = player.offsetWidth;
+    const playerLeft = mouseX - playerWidth / 2;
+    player.style.left = playerLeft + "px";
+    checkCollision()
+  }
+
+  document.addEventListener("mousemove", handleMouseMove);
+  
+  player.addEventListener("touchmove", event => {
+    movePlayer(event.touches[0].clientX - player.offsetWidth / 2);
+  });
+  
+  window.addEventListener("keydown", handleKeyDown);
+  window.addEventListener("click", createBullet);
+      
+  setInterval(() => {
+    const rainDiv = document.createElement("div");
+    rainDiv.classList.add("rain");
+    rainDiv.innerText = asciiChars[Math.floor(Math.random() * numChars)];
+    rainDiv.style.left = Math.floor(Math.random() * window.innerWidth) + "px";
+    document.body.appendChild(rainDiv);
+    
+    setTimeout(() => {
+      rainDiv.remove();
+    }, 2000);
+  }, 50);
+</script>
+  </body>
+</html>

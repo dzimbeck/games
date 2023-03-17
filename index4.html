@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+<head>
+    <title>Game Selector</title>
+    <style>
+      .header {
+        background-color: black;
+        color: white;
+        text-align: center;
+        padding: 10px;
+      }
+      .dropdown {
+        position: relative;
+        display: inline-block;
+      }
+      .dropdown-content {
+        display: none;
+        position: absolute;
+        background-color: #f9f9f9;
+        min-width: 160px;
+        box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+        z-index: 1;
+      }
+      .dropdown:hover .dropdown-content {
+        display: block;
+      }
+      .dropdown-content a {
+        color: black;
+        padding: 12px 16px;
+        text-decoration: none;
+        display: block;
+      }
+      .dropdown-content a:hover {
+        background-color: #f1f1f1;
+      }
+    </style>
+  </head>
+    <div class="header">
+      <div class="dropdown">
+        <button class="dropbtn">Select a Game</button>
+        <div class="dropdown-content">
+          <a href="index.html">Maze</a>
+          <a href="index2.html">Unfair Pong</a>
+          <a href="index3.html">Dodging Rain</a>
+          <a href="index4.html">Catch a Rain Drop</a>
+        </div>
+      </div>
+    </div>
+</head>
+    <meta charset="UTF-8">
+    <title>Raining ASCII Animation</title>
+    <style>
+      /* CSS styles for the animation */
+      body {
+        background-color: #000000;
+        overflow: hidden;
+      }
+      .rain {
+        color: #ffffff;
+        position: absolute;
+        top: -20px;
+        font-size: 20px;
+        animation: raindrop 2s linear;
+      }
+      @keyframes raindrop {
+        0% {
+          top: -20px;
+        }
+        100% {
+          top: 100%;
+        }
+      }
+      #counter {
+        position: absolute;
+        top: 0;
+        left: 0;
+        color: red;
+        font-size: 24px;
+      }
+    </style>
+  <body>
+    <div id="counter">0</div>
+    <script>
+      alert("Try to click on the falling 'o' rain drops! Each one you find you get a point.");
+      // JavaScript code for the animation
+      const asciiChars = "!@#$%^&*()-_=+[]{}|;:',.<>/?`~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const numChars = asciiChars.length;
+      
+      let count = 0;
+      
+      document.addEventListener("click", (event) => {
+        const target = event.target;
+        if (target.classList.contains("rain")) {
+          const char = target.innerText;
+          if (char === "o") {
+            count++;
+            document.getElementById("counter").innerText = count;
+            const audio = new Audio("beep.mp3");
+            audio.play();
+          }
+        }
+      });
+      
+      setInterval(() => {
+        const rainDiv = document.createElement("div");
+        rainDiv.classList.add("rain");
+        rainDiv.innerText = asciiChars[Math.floor(Math.random() * numChars)];
+        rainDiv.style.left = Math.floor(Math.random() * window.innerWidth) + "px";
+        document.body.appendChild(rainDiv);
+        
+        setTimeout(() => {
+          rainDiv.remove();
+        }, 2000);
+      }, 50);
+    </script>
+  </body>
+</html>
