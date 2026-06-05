@@ -54,7 +54,9 @@ def load_pipeline(model_dir, pipeline_kind, mode):
                 components_to_quantize=["transformer", "text_encoder"],
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"WARNING: 4-bit quantization unavailable ({exc}); using CPU offload.")
+            print(f"WARNING: 4-bit quantization unavailable ({exc}).")
+            print("         Install it with `pip install bitsandbytes` for lower VRAM use.")
+            print("         Falling back to CPU offload for now.")
             quantization_config = None
             mode = "offload"
 

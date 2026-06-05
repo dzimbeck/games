@@ -42,11 +42,12 @@ def main():
             ignore_patterns=["*.gguf", "flux2-*.safetensors", "flux-2-*.safetensors"],
         )
     except Exception as exc:  # noqa: BLE001 - surface a friendly message
-        print(f"ERROR: Failed to download {repo_id}: {exc}")
+        print(f"ERROR: Failed to download {repo_id}: {type(exc).__name__}: {exc}")
         print()
-        print("If this model is gated/non-commercial you must accept its license")
-        print("on its Hugging Face page and authenticate first:")
-        print("    huggingface-cli login")
+        print("Common causes:")
+        print("  - Gated/non-commercial model: accept its license on the model's")
+        print("    Hugging Face page, then authenticate with `huggingface-cli login`.")
+        print("  - Network/proxy issues or insufficient disk space.")
         return 1
 
     # Record which repo this folder came from for reference.
