@@ -1,0 +1,12 @@
+# FLUX.2 dependencies for local image editing / inpainting.
+# FLUX.2 pipelines currently ship on diffusers main.
+git+https://github.com/huggingface/diffusers.git
+transformers>=4.57.0
+accelerate
+safetensors
+huggingface_hub>=0.26.0
+Pillow
+# Install torch/torchvision separately with the right CUDA build, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Optional, only needed for the 4-bit "quant" mode on small GPUs:
+#   pip install bitsandbytes
