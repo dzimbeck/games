@@ -79,6 +79,70 @@ def load_pipeline(model_dir, pipeline_kind, mode):
     return pipe
 
 
+def generate_image(
+    pipe,
+    prompt,
+    ref_images=None,
+    mask=None,
+    width=None,
+    height=None,
+    steps=4,
+    guidance=4.0,
+    seed=42,
+):
+    """Run one FLUX.2 generation and return a ``PIL.Image``.
+
+    This is the reusable core shared by the command-line ``main`` and by the
+    GUI / any future API. It mirrors the three CLI modes:
+
+    * ``ref_images is None``            -> text-to-image.
+    * ``ref_images`` given             -> instruction edit using the references.
+    * ``ref_images`` + ``mask`` given  -> masked inpaint: the edit is composited
+      back onto the first reference image so only the white area of ``mask``
+      changes.
+
+    ``ref_images`` and ``mask`` may be file paths or ``PIL.Image`` objects.
+    """
+    base_image = None
+    loaded_refs = None
+    if ref_images is not None:
+        loaded_refs = [
+            img if isinstance(img, Image.Image) else Image.open(img)
+            for img in ref_images
+        ]
+        loaded_refs = [img.convert("RGB") for img in loaded_refs]
+        base_image = loaded_refs[0]
+        if width is None or height is None:
+            width, height = round_to(base_image.width), round_to(base_image.height)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    call_kwargs = {
+        "prompt": prompt,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+        "generator": generator,
+    }
+    if loaded_refs is not None:
+        call_kwargs["image"] = loaded_refs
+    if width is not None and height is not None:
+        call_kwargs["width"] = width
+        call_kwargs["height"] = height
+
+    result = pipe(**call_kwargs).images[0]
+
+    if mask is not None:
+        if base_image is None:
+            raise ValueError("A mask requires at least one reference image.")
+        mask_img = mask if isinstance(mask, Image.Image) else Image.open(mask)
+        mask_img = mask_img.convert("L").resize(base_image.size)
+        edited = result.resize(base_image.size)
+        result = Image.composite(edited, base_image, mask_img)
+
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="FLUX.2 local image editing / inpainting")
     parser.add_argument("--model-dir", required=True, help="Path to the downloaded model folder")
@@ -111,38 +175,18 @@ def main():
     print(f"Loading {args.pipeline} pipeline from {args.model_dir} (mode={args.mode})...")
     pipe = load_pipeline(args.model_dir, args.pipeline, args.mode)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-
-    ref_images = None
-    base_image = None
-    height, width = args.height, args.width
-    if args.image:
-        ref_images = [Image.open(p).convert("RGB") for p in args.image]
-        base_image = ref_images[0]
-        if height is None or width is None:
-            width, height = round_to(base_image.width), round_to(base_image.height)
-
-    call_kwargs = {
-        "prompt": args.prompt,
-        "num_inference_steps": args.steps,
-        "guidance_scale": args.guidance,
-        "generator": generator,
-    }
-    if ref_images is not None:
-        call_kwargs["image"] = ref_images
-    if height is not None and width is not None:
-        call_kwargs["height"] = height
-        call_kwargs["width"] = width
-
     print("Running FLUX.2 inference...")
-    result = pipe(**call_kwargs).images[0]
-
-    # Masked inpainting: keep the original everywhere except the white mask area.
-    if args.mask:
-        mask = Image.open(args.mask).convert("L").resize(base_image.size)
-        edited = result.resize(base_image.size)
-        result = Image.composite(edited, base_image, mask)
+    result = generate_image(
+        pipe,
+        prompt=args.prompt,
+        ref_images=args.image,
+        mask=args.mask,
+        width=args.width,
+        height=args.height,
+        steps=args.steps,
+        guidance=args.guidance,
+        seed=args.seed,
+    )
 
     result.save(args.output)
     print(f"Saved: {args.output}")

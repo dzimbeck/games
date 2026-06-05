@@ -216,6 +216,17 @@ echo Writing launcher: %RUN_BAT%
     echo python "%%SCRIPT_DIR%%inpaint.py" --model-dir "%%SCRIPT_DIR%%ai-model\model" --pipeline %PIPELINE% --mode %RUN_MODE% --steps %STEPS% %%*
 ) > "%RUN_BAT%"
 
+:: ---- Generate a launcher for the grid map painter GUI ----
+set "GUI_BAT=%SCRIPT_DIR%run_gui.bat"
+echo Writing launcher: %GUI_BAT%
+(
+    echo @echo off
+    echo setlocal
+    echo set "SCRIPT_DIR=%%~dp0"
+    echo call "%%SCRIPT_DIR%%ai-model\venv\Scripts\activate.bat"
+    echo python "%%SCRIPT_DIR%%map_gui.py" --model-dir "%%SCRIPT_DIR%%ai-model\model" --pipeline %PIPELINE% --mode %RUN_MODE% --steps %STEPS% %%*
+) > "%GUI_BAT%"
+
 echo.
 echo ===========================================================
 echo   Installation complete!
@@ -223,7 +234,11 @@ echo ===========================================================
 echo.
 echo Model installed to: %AI_DIR%\model
 echo.
-echo To edit / inpaint an image, run:
+echo To open the grid map painter (GUI), run:
+echo.
+echo   run_gui.bat
+echo.
+echo To edit / inpaint a single image from the command line, run:
 echo.
 echo   run_inpaint.bat --image input.png --prompt "make the sky a starry night" --output result.png
 echo.

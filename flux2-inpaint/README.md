@@ -21,6 +21,45 @@ this folder, installs PyTorch + diffusers, and downloads the right model for you
 Everything is installed under `flux2-inpaint/ai-model/` (Python, the venv and the
 model weights), so nothing touches your system Python.
 
+## Grid map painter (GUI)
+
+For bulk / procedural map building there is a simple grid "paint program",
+`run_gui.bat` (created by the installer). It treats the world as a matrix of
+equally sized tiles where **each tile is one FLUX.2 generation**:
+
+1. On launch, choose the **matrix size** (number of tiles, e.g. `690 x 690`) and
+   the **cell size** in pixels (e.g. `768 x 768`; rounded to a multiple of 16).
+2. The view starts **zoomed out to 1/4** at the top-left tile so you can see the
+   grid. Only the tiles inside the current viewport are rendered, so even very
+   large maps stay responsive. Use `+` / `-` / mouse-wheel to zoom, the
+   scrollbars or middle/right-drag to pan, and **Fit** to frame the whole map.
+3. **Click** a tile to select it, or **drag** to select a block of adjacent
+   tiles (click a selected tile again to deselect it).
+4. Press **Generate** and type a description. Empty (black) tiles in the
+   selection are **outpainted**; if part of the selection is already filled, the
+   remaining black area is **inpainted** instead, using the filled neighbours for
+   continuity. (This is decided per pixel by an automatic mask.)
+5. **Upload reference** adds reference images, shown as thumbnails along the top;
+   remove or swap them at any time. They are passed to the generator as extra
+   guidance.
+6. **Save map** writes the tiles to a folder; **Export PNG** flattens the whole
+   map to a single image.
+
+The first generation loads the model (it can take a while); afterwards the
+pipeline stays in memory for fast subsequent tiles.
+
+### Scripting / automation
+
+The GUI is a thin layer over reusable, importable pieces so you can automate a
+whole map or build an API later:
+
+* `mapmodel.MapModel` — the pure (no-torch) tile grid: region compositing, mask
+  building, slicing a result back into tiles, save/load.
+* `inpaint.generate_image(...)` — one FLUX.2 generation (text-to-image, edit, or
+  masked inpaint), shared by the CLI and the GUI.
+* `mapgen.MapGenerator` — loads the pipeline once and fills a selection of tiles
+  via `generate_region(model, cells, prompt, ref_images=...)`.
+
 ## Which model gets installed?
 
 The installer asks for your VRAM and picks a FLUX.2 model + runtime mode. Model
@@ -100,7 +139,10 @@ run_inpaint.bat --image room.png --mask mask.png --prompt "add a window on the w
 
 | File | Purpose |
 | --- | --- |
-| `install.bat` | One-click Windows installer (asks VRAM, builds venv, downloads model) |
+| `install.bat` | One-click Windows installer (asks VRAM, builds venv, downloads model, writes `run_gui.bat` + `run_inpaint.bat`) |
 | `download_model.py` | Downloads the selected FLUX.2 model snapshot locally |
-| `inpaint.py` | diffusers-based editing / inpainting runner |
+| `inpaint.py` | diffusers-based editing / inpainting runner (CLI + reusable `generate_image`) |
+| `mapmodel.py` | Pure tile-grid model used by the GUI and for scripting/automation |
+| `mapgen.py` | Bridges the grid model to FLUX.2 (`MapGenerator.generate_region`) |
+| `map_gui.py` | Grid "paint program" GUI (Tkinter) for bulk out/inpainting |
 | `requirements.txt` | Python dependencies for a manual setup |

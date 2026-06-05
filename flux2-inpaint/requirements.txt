@@ -6,6 +6,8 @@ accelerate
 safetensors
 huggingface_hub>=0.26.0
 Pillow
+# The grid map painter GUI (map_gui.py) also needs Tkinter, which ships with the
+# standard CPython installers (and the pyenv-win build used by install.bat).
 # Install torch/torchvision separately with the right CUDA build, e.g.:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 # Optional, only needed for the 4-bit "quant" mode on small GPUs:
