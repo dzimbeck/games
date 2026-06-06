@@ -110,7 +110,11 @@ def _aria2_asset_matches(name, os_key, machine):
     if not n.startswith("aria2-"):
         return False
     is_arm = any(t in machine for t in ("arm", "aarch64"))
-    is_64 = (sys.maxsize > 2 ** 32) or "64" in machine
+    # aria2c is a standalone binary, so the *OS* architecture (platform.machine,
+    # e.g. "AMD64"/"x86_64") is what matters -- not the Python interpreter's
+    # bitness. We treat the platform as 64-bit if either the OS arch string says
+    # so or the running Python is 64-bit (covers 32-bit Python on a 64-bit OS).
+    is_64 = ("64" in machine) or (sys.maxsize > 2 ** 32)
     if os_key == "windows":
         return "win" in n and n.endswith(".zip") and (
             ("64bit" in n) if is_64 else ("32bit" in n)
@@ -158,7 +162,7 @@ def _aria2_candidate_urls(os_key, machine):
 
     # Constructed fallbacks for the pinned version.
     v = ARIA2_VERSION
-    bits = "64bit" if (sys.maxsize > 2 ** 32 or "64" in machine) else "32bit"
+    bits = "64bit" if ("64" in machine or sys.maxsize > 2 ** 32) else "32bit"
     base = f"https://github.com/{ARIA2_STATIC_REPO}/releases/download/v{v}"
     if os_key == "windows":
         urls.append(ARIA2_OFFICIAL_WIN.format(v=v, bits=bits))
