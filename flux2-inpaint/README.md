@@ -21,6 +21,20 @@ this folder, installs PyTorch + diffusers, and downloads the right model for you
 Everything is installed under `flux2-inpaint/ai-model/` (Python, the venv and the
 model weights), so nothing touches your system Python.
 
+### If the download is interrupted
+
+The installer is **safe to re-run**. If your internet drops part-way through (a
+common problem with multi-GB model downloads), just double-click `install.bat`
+again:
+
+- Steps that already finished are detected and skipped — pyenv, Python, the
+  virtual environment and any Python packages that already import are left as-is.
+- The model download is **resumable**: it continues from the partially
+  downloaded files instead of starting over, retries transient network errors
+  automatically (with backoff), and writes a `DOWNLOAD_COMPLETE` marker once the
+  model is fully present so future runs skip it entirely.
+
+
 ## Grid map painter (GUI)
 
 For bulk / procedural map building there is a simple grid "paint program",

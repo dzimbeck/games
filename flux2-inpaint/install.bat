@@ -170,36 +170,85 @@ python -m pip install --upgrade pip
 
 echo.
 echo Installing PyTorch...
-:: Check for NVIDIA GPU
-nvidia-smi >nul 2>&1
-if errorlevel 1 (
-    echo No NVIDIA GPU detected. Installing CPU-only PyTorch...
-    echo WARNING: FLUX.2 is very slow without a CUDA GPU.
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+:: Skip if torch is already importable (so a re-run after a dropped connection
+:: does not re-download the multi-GB wheels). Check for an NVIDIA GPU first.
+python -c "import torch" >nul 2>&1
+if not errorlevel 1 (
+    echo PyTorch already installed; skipping.
 ) else (
-    echo NVIDIA GPU detected. Installing CUDA-enabled PyTorch...
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    nvidia-smi >nul 2>&1
+    if errorlevel 1 (
+        echo No NVIDIA GPU detected. Installing CPU-only PyTorch...
+        echo WARNING: FLUX.2 is very slow without a CUDA GPU.
+        set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
+    ) else (
+        echo NVIDIA GPU detected. Installing CUDA-enabled PyTorch...
+        set "TORCH_INDEX=https://download.pytorch.org/whl/cu124"
+    )
+    set "PIP_ARGS=install torch torchvision --index-url !TORCH_INDEX!"
+    call :pip_retry
+    if errorlevel 1 (
+        echo ERROR: Failed to install PyTorch after several attempts.
+        echo        Check your connection and re-run install.bat to continue.
+        pause
+        exit /b 1
+    )
 )
 
 echo.
 echo Installing FLUX.2 dependencies...
 :: FLUX.2 pipelines (Flux2Pipeline / Flux2KleinPipeline) currently live on
 :: diffusers main, and the klein text encoder needs a recent transformers.
-pip install "git+https://github.com/huggingface/diffusers.git"
-pip install "transformers>=4.57.0" accelerate safetensors "huggingface_hub>=0.26.0" Pillow
+:: Each group is skipped when it already imports, so re-running is cheap.
+python -c "import diffusers" >nul 2>&1
+if not errorlevel 1 (
+    echo diffusers already installed; skipping.
+) else (
+    set "PIP_ARGS=install git+https://github.com/huggingface/diffusers.git"
+    call :pip_retry
+    if errorlevel 1 goto :deps_failed
+)
+
+python -c "import transformers, accelerate, safetensors, huggingface_hub, PIL" >nul 2>&1
+if not errorlevel 1 (
+    echo Core dependencies already installed; skipping.
+) else (
+    set "PIP_ARGS=install transformers accelerate safetensors huggingface_hub Pillow"
+    call :pip_retry
+    if errorlevel 1 goto :deps_failed
+)
+
+:: hf_transfer makes large downloads faster and more resilient. It is optional:
+:: download_model.py uses it only if present, so ignore any failure here.
+python -c "import hf_transfer" >nul 2>&1
+if errorlevel 1 (
+    echo Installing hf_transfer for more resilient downloads (optional)...
+    pip install hf_transfer
+)
+
 if "%RUN_MODE%"=="quant" (
-    echo Installing bitsandbytes for 4-bit quantization...
-    pip install bitsandbytes
+    python -c "import bitsandbytes" >nul 2>&1
+    if errorlevel 1 (
+        echo Installing bitsandbytes for 4-bit quantization...
+        set "PIP_ARGS=install bitsandbytes"
+        call :pip_retry
+        if errorlevel 1 goto :deps_failed
+    ) else (
+        echo bitsandbytes already installed; skipping.
+    )
 )
 
 echo.
 echo Downloading model: %MODEL_NAME%
 echo This may take a while depending on your internet connection...
+echo If the connection drops, just run install.bat again to resume.
 
 python "%SCRIPT_DIR%download_model.py" "%MODEL_NAME%" "%AI_DIR%"
 if errorlevel 1 (
     echo ERROR: Failed to download the model.
-    echo If the model is gated, accept its license on Hugging Face and run:
+    echo The download is resumable: re-run install.bat to continue where it
+    echo left off. If the model is gated, accept its license on Hugging Face
+    echo and run:
     echo     pip install huggingface_hub ^&^& huggingface-cli login
     pause
     exit /b 1
@@ -252,3 +301,35 @@ echo.
 echo   run_inpaint.bat --image input.png --mask mask.png --prompt "add a red hat" --output result.png
 echo.
 pause
+goto :eof
+
+:: ----------------------------------------------------------------
+:: Helper: run "pip %PIP_ARGS%" with a few automatic retries so a brief
+:: network drop does not abort the whole install. Sets errorlevel 1 if every
+:: attempt fails. Re-running install.bat later resumes from this same point.
+:: ----------------------------------------------------------------
+:pip_retry
+setlocal enabledelayedexpansion
+set "attempt=0"
+:pip_retry_loop
+set /a attempt+=1
+echo   pip %PIP_ARGS%   (attempt !attempt!/4)
+pip %PIP_ARGS%
+if not errorlevel 1 (
+    endlocal & exit /b 0
+)
+if !attempt! GEQ 4 (
+    echo   pip step failed after !attempt! attempts.
+    endlocal & exit /b 1
+)
+echo   pip step failed; retrying in 10s...
+ping -n 11 127.0.0.1 >nul 2>&1
+goto :pip_retry_loop
+
+:deps_failed
+echo.
+echo ERROR: Failed to install a Python dependency after several attempts.
+echo        Check your internet connection and simply run install.bat again --
+echo        completed steps are skipped, so it will pick up where it left off.
+pause
+exit /b 1

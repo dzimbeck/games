@@ -12,3 +12,6 @@ Pillow
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 # Optional, only needed for the 4-bit "quant" mode on small GPUs:
 #   pip install bitsandbytes
+# Optional, makes large model downloads faster and more resilient to drops
+# (download_model.py uses it automatically when present):
+#   pip install hf_transfer
