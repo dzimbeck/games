@@ -42,13 +42,16 @@ INITIAL_BACKOFF = 5  # seconds; doubles each retry, capped at MAX_BACKOFF
 MAX_BACKOFF = 120
 
 
-def _enable_hf_transfer_if_available():
-    """Use hf_transfer (faster, more resilient) when it is installed."""
-    try:
-        import hf_transfer  # noqa: F401
-    except Exception:  # noqa: BLE001 - it is optional
-        return
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+def _force_visible_progress():
+    """Make sure the Hugging Face download shows its tqdm progress bars.
+
+    hf_transfer (``HF_HUB_ENABLE_HF_TRANSFER``) gives faster downloads but
+    suppresses the per-file progress bars and, on some Windows setups, stalls
+    at 0% leaving only ``*.incomplete`` files. We disable it so the standard,
+    resumable downloader with visible progress bars is always used.
+    """
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
 
 
 def download_with_resume(repo_id, target_dir):
@@ -56,7 +59,7 @@ def download_with_resume(repo_id, target_dir):
 
     Returns True on success, False if every attempt failed.
     """
-    _enable_hf_transfer_if_available()
+    _force_visible_progress()
 
     attempt = 0
     backoff = INITIAL_BACKOFF

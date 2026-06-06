@@ -218,13 +218,6 @@ if not errorlevel 1 (
     if errorlevel 1 goto :deps_failed
 )
 
-:: hf_transfer makes large downloads faster and more resilient. It is optional:
-:: download_model.py uses it only if present, so ignore any failure here.
-python -c "import hf_transfer" >nul 2>&1
-if errorlevel 1 (
-    echo Installing hf_transfer for more resilient downloads (optional)...
-    pip install hf_transfer
-)
 
 if "%RUN_MODE%"=="quant" (
     python -c "import bitsandbytes" >nul 2>&1
