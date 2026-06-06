@@ -362,16 +362,38 @@ def download_with_aria2(repo_id, target_dir, files, token):
 
         # Poll until everything is done (or unrecoverably errored).
         last_line_len = 0
+        # If the RPC stops responding for several consecutive polls (or the
+        # aria2 process dies) we abort instead of looping forever. The outer
+        # retry loop in main() then restarts and resumes from the control files.
+        consecutive_rpc_failures = 0
+        max_rpc_failures = 20  # ~10s at the 0.5s poll interval
         while True:
-            stats = api.get_stats()
+            if daemon.poll() is not None:
+                sys.stdout.write("\n")
+                print("  ERROR: the aria2 process exited unexpectedly.")
+                return False
+
+            try:
+                stats = api.get_stats()
+            except Exception:  # noqa: BLE001 - RPC not responding this tick
+                consecutive_rpc_failures += 1
+                if consecutive_rpc_failures >= max_rpc_failures:
+                    sys.stdout.write("\n")
+                    print("  ERROR: lost contact with the aria2 RPC server.")
+                    return False
+                time.sleep(0.5)
+                continue
+
             completed = 0
             total = 0
             errored = []
             n_done = 0
+            update_failures = 0
             for dl in downloads:
                 try:
                     dl.update()
-                except Exception:  # noqa: BLE001 - transient RPC hiccup
+                except Exception:  # noqa: BLE001 - transient per-download hiccup
+                    update_failures += 1
                     continue
                 completed += dl.completed_length or 0
                 total += dl.total_length or 0
@@ -379,6 +401,19 @@ def download_with_aria2(repo_id, target_dir, files, token):
                     n_done += 1
                 elif dl.status == "error":
                     errored.append(dl)
+
+            # Healthy poll (stats worked and at least one download updated)
+            # resets the failure counter; an all-failed poll counts toward the
+            # abort threshold so a persistently broken RPC is detected.
+            if update_failures >= len(downloads) and downloads:
+                consecutive_rpc_failures += 1
+                if consecutive_rpc_failures >= max_rpc_failures:
+                    sys.stdout.write("\n")
+                    print("  ERROR: aria2 RPC stopped responding to status "
+                          "queries.")
+                    return False
+            else:
+                consecutive_rpc_failures = 0
 
             grand_total = max(total, expected_total) or 1
             speed = stats.download_speed or 0
