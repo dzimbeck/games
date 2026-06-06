@@ -5,6 +5,10 @@ transformers>=4.57.0
 accelerate
 safetensors
 huggingface_hub>=0.26.0
+# aria2p drives the aria2 downloader used by download_model.py for resumable,
+# progress-visible model downloads. The aria2 binary itself is fetched
+# automatically (or use a system 'aria2c' on PATH).
+aria2p>=0.11
 Pillow
 # The grid map painter GUI (map_gui.py) also needs Tkinter, which ships with the
 # standard CPython installers (and the pyenv-win build used by install.bat).

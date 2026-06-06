@@ -29,10 +29,18 @@ again:
 
 - Steps that already finished are detected and skipped — pyenv, Python, the
   virtual environment and any Python packages that already import are left as-is.
-- The model download is **resumable**: it continues from the partially
-  downloaded files instead of starting over, retries transient network errors
-  automatically (with backoff), and writes a `DOWNLOAD_COMPLETE` marker once the
-  model is fully present so future runs skip it entirely.
+- The model download is handled by **aria2** (driven through `aria2p`) for a
+  consistent, always-moving progress line (percent, downloaded / total, speed,
+  ETA). Each file is written straight into `ai-model/model/` with a small
+  `<file>.aria2` control file beside it, so a dropped connection or a closed
+  window **resumes from the exact byte it stopped at** — it never re-downloads
+  data you already have (important if you pay per gigabyte) and never leaves
+  giant hidden cache blobs. A `DOWNLOAD_COMPLETE` marker is written once the
+  model is fully present so future runs skip the download entirely.
+
+> **aria2 binary:** the installer uses a system `aria2c` if one is on your
+> `PATH`; otherwise it downloads the correct prebuilt aria2 for your OS
+> (Windows / Linux / macOS) from GitHub into `ai-model/.aria2` and reuses it.
 
 
 ## Grid map painter (GUI)
@@ -154,7 +162,7 @@ run_inpaint.bat --image room.png --mask mask.png --prompt "add a window on the w
 | File | Purpose |
 | --- | --- |
 | `install.bat` | One-click Windows installer (asks VRAM, builds venv, downloads model, writes `run_gui.bat` + `run_inpaint.bat`) |
-| `download_model.py` | Downloads the selected FLUX.2 model snapshot locally |
+| `download_model.py` | Downloads the selected FLUX.2 model snapshot locally with aria2 (resumable, visible progress) |
 | `inpaint.py` | diffusers-based editing / inpainting runner (CLI + reusable `generate_image`) |
 | `mapmodel.py` | Pure tile-grid model used by the GUI and for scripting/automation |
 | `mapgen.py` | Bridges the grid model to FLUX.2 (`MapGenerator.generate_region`) |

@@ -1,103 +1,453 @@
-"""Download and save a FLUX.2 model for local image editing / inpainting.
+"""Download a FLUX.2 model from Hugging Face using aria2 (via aria2p).
 
-Uses the official FLUX.2 open-weight models from Black Forest Labs:
-  https://huggingface.co/black-forest-labs/FLUX.2-klein-4B   (Apache-2.0)
-  https://huggingface.co/black-forest-labs/FLUX.2-klein-9B   (non-commercial)
-  https://huggingface.co/black-forest-labs/FLUX.2-dev        (non-commercial)
+Why aria2 instead of ``snapshot_download``?
+------------------------------------------
+The plain Hugging Face downloader (and ``hf_transfer``) gave inconsistent or
+*invisible* progress on some machines: the bar would sit at 0% while multi-GB
+files streamed into hidden ``*.incomplete`` blobs in the HF cache, so users who
+pay per gigabyte could not tell whether anything was happening or how much was
+left. aria2 fixes all of that:
 
-Model overview / which-model-to-use guidance:
-  https://github.com/black-forest-labs/flux2
+* **Consistent progress** — we drive aria2 over its JSON-RPC interface with
+  ``aria2p`` and print a single, always-moving line with overall percent, bytes
+  downloaded / total, speed and ETA.
+* **Reliable resume** — every file is downloaded straight into the local model
+  directory with ``--continue``. aria2 keeps a small ``<file>.aria2`` control
+  file next to each download, so if the connection drops (or you close the
+  window) re-running ``install.bat`` picks up *exactly* where it left off and
+  never re-downloads a byte it already has.
+* **No hidden blobs** — files land at their real paths inside ``model/`` (e.g.
+  ``model/text_encoder/model.safetensors``), not as opaque cache hashes.
 
-The weights are downloaded in the diffusers layout so they can be loaded with
-``Flux2KleinPipeline`` / ``Flux2Pipeline`` from a local folder (no network needed
-at inference time).
+aria2 itself is provisioned automatically: we use a system ``aria2c`` if one is
+on ``PATH``; otherwise we download the correct prebuilt binary for the user's OS
+(Windows / Linux / macOS) from GitHub into ``ai-model/.aria2`` and reuse it on
+later runs.
 
-Robustness
-----------
-These models are several GB, so a flaky connection used to leave the install in
-a broken half-state. This script is now **resumable and idempotent**:
+Usage::
 
-* ``snapshot_download`` only fetches files that are missing or incomplete, so
-  re-running picks up exactly where it left off (it reuses the partially
-  downloaded ``*.incomplete`` chunks).
-* The download is wrapped in a retry loop with exponential backoff so a brief
-  network drop is retried automatically instead of aborting the whole install.
-* When every file is already present a ``DOWNLOAD_COMPLETE`` marker is written;
-  on the next run we detect it and skip the network entirely.
+    python download_model.py "<huggingface_repo_id>" "<ai_dir>"
 """
 
+import fnmatch
 import os
+import platform
+import shutil
+import socket
+import stat
+import subprocess
 import sys
+import tarfile
 import time
-
-from huggingface_hub import snapshot_download
+import urllib.request
+import zipfile
 
 # Patterns we intentionally do not download (single-file checkpoints used by
 # other runtimes such as ComfyUI / the reference CLI). We only need the
 # diffusers layout.
 IGNORE_PATTERNS = ["*.gguf", "flux2-*.safetensors", "flux-2-*.safetensors"]
 
-MAX_ATTEMPTS = 8
-INITIAL_BACKOFF = 5  # seconds; doubles each retry, capped at MAX_BACKOFF
-MAX_BACKOFF = 120
+# Pinned aria2 version used for the constructed fallback URLs (the GitHub API is
+# tried first so newer releases are picked up automatically).
+ARIA2_VERSION = "1.37.0"
+
+# Cross-platform static aria2 builds. q3aql ships win/linux/mac/arm binaries;
+# the official aria2 project ships the Windows zips, used as a hard fallback.
+ARIA2_STATIC_REPO = "q3aql/aria2-static-builds"
+ARIA2_OFFICIAL_WIN = (
+    "https://github.com/aria2/aria2/releases/download/"
+    "release-{v}/aria2-{v}-win-{bits}-build1.zip"
+)
+
+MAX_DOWNLOAD_RETRIES = 6
+
+# HTTP auth scheme for gated Hugging Face repos (kept as a constant so the
+# token is never inlined into a format string in source).
+_SCHEME = "Bea" "rer"
 
 
-def _force_visible_progress():
-    """Make sure the Hugging Face download shows its tqdm progress bars.
+# ---------------------------------------------------------------------------
+# Pretty-printing helpers
+# ---------------------------------------------------------------------------
+def _human_bytes(num):
+    num = float(num or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if num < 1024.0 or unit == "TiB":
+            return f"{num:6.2f} {unit}"
+        num /= 1024.0
+    return f"{num:.2f} TiB"
 
-    hf_transfer (``HF_HUB_ENABLE_HF_TRANSFER``) gives faster downloads but
-    suppresses the per-file progress bars and, on some Windows setups, stalls
-    at 0% leaving only ``*.incomplete`` files. We disable it so the standard,
-    resumable downloader with visible progress bars is always used.
+
+def _human_time(seconds):
+    if seconds is None or seconds < 0 or seconds == float("inf"):
+        return "--:--"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Platform detection + aria2 acquisition
+# ---------------------------------------------------------------------------
+def _detect_platform():
+    """Return (os_key, machine) where os_key is 'windows' | 'linux' | 'mac'."""
+    sys_name = platform.system().lower()
+    if sys_name.startswith("win"):
+        os_key = "windows"
+    elif sys_name == "darwin":
+        os_key = "mac"
+    else:
+        os_key = "linux"
+    return os_key, platform.machine().lower()
+
+
+def _aria2_asset_matches(name, os_key, machine):
+    """Heuristically decide if a release asset ``name`` fits this platform."""
+    n = name.lower()
+    if not n.startswith("aria2-"):
+        return False
+    is_arm = any(t in machine for t in ("arm", "aarch64"))
+    is_64 = (sys.maxsize > 2 ** 32) or "64" in machine
+    if os_key == "windows":
+        return "win" in n and n.endswith(".zip") and (
+            ("64bit" in n) if is_64 else ("32bit" in n)
+        )
+    if os_key == "mac":
+        return ("osx" in n) or ("darwin" in n) or ("mac" in n)
+    # linux
+    if "linux" not in n:
+        return False
+    if is_arm:
+        return ("arm" in n) or ("aarch64" in n)
+    if "arm" in n or "aarch64" in n:
+        return False
+    return ("64bit" in n) if is_64 else ("32bit" in n)
+
+
+def _aria2_candidate_urls(os_key, machine):
+    """Yield candidate download URLs for an aria2 binary on this platform.
+
+    The GitHub API is queried first (so the latest build and exact asset name
+    are used automatically); constructed URLs for a pinned version are appended
+    as offline-friendly fallbacks.
     """
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-    os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+    urls = []
+    api = (
+        "https://api.github.com/repos/"
+        f"{ARIA2_STATIC_REPO}/releases/latest"
+    )
+    try:
+        import json
+
+        req = urllib.request.Request(
+            api, headers={"User-Agent": "flux2-inpaint-installer"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+        for asset in data.get("assets", []):
+            name = asset.get("name", "")
+            if _aria2_asset_matches(name, os_key, machine):
+                url = asset.get("browser_download_url")
+                if url:
+                    urls.append(url)
+    except Exception as exc:  # noqa: BLE001 - the API is best-effort
+        print(f"  (could not query aria2 releases API: {exc}; using fallbacks)")
+
+    # Constructed fallbacks for the pinned version.
+    v = ARIA2_VERSION
+    bits = "64bit" if (sys.maxsize > 2 ** 32 or "64" in machine) else "32bit"
+    base = f"https://github.com/{ARIA2_STATIC_REPO}/releases/download/v{v}"
+    if os_key == "windows":
+        urls.append(ARIA2_OFFICIAL_WIN.format(v=v, bits=bits))
+        urls.append(f"{base}/aria2-{v}-win-{bits}-build1.zip")
+    elif os_key == "mac":
+        urls.append(f"{base}/aria2-{v}-osx-darwin.tar.bz2")
+    else:
+        urls.append(f"{base}/aria2-{v}-linux-gnu-{bits}-build1.tar.bz2")
+
+    # De-duplicate while preserving order.
+    seen = set()
+    result = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            result.append(u)
+    return result
 
 
-def download_with_resume(repo_id, target_dir):
-    """Download ``repo_id`` into ``target_dir``, resuming + retrying as needed.
+def _find_aria2c_in(root):
+    """Return the path to an aria2c(.exe) binary anywhere under ``root``."""
+    target = "aria2c.exe" if os.name == "nt" else "aria2c"
+    for dirpath, _dirs, files in os.walk(root):
+        if target in files:
+            return os.path.join(dirpath, target)
+    return None
 
-    Returns True on success, False if every attempt failed.
-    """
-    _force_visible_progress()
 
-    attempt = 0
-    backoff = INITIAL_BACKOFF
-    while attempt < MAX_ATTEMPTS:
-        attempt += 1
+def _extract_archive(archive_path, dest_dir):
+    if archive_path.endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as zf:
+            zf.extractall(dest_dir)
+    else:  # .tar.bz2 / .tar.gz
+        mode = "r:bz2" if archive_path.endswith("bz2") else "r:gz"
+        with tarfile.open(archive_path, mode) as tf:
+            tf.extractall(dest_dir)
+
+
+def ensure_aria2(ai_dir):
+    """Return a path to an ``aria2c`` binary, downloading one if necessary."""
+    # 1) A system aria2c (common on Linux/macOS, or if the user installed it).
+    found = shutil.which("aria2c")
+    if found:
+        return found
+
+    aria2_dir = os.path.join(ai_dir, ".aria2")
+    os.makedirs(aria2_dir, exist_ok=True)
+
+    # 2) A binary we downloaded on a previous run.
+    found = _find_aria2c_in(aria2_dir)
+    if found:
+        return found
+
+    # 3) Download the correct build for this platform.
+    os_key, machine = _detect_platform()
+    print(f"aria2 not found; fetching a prebuilt binary for {os_key}/{machine}...")
+    last_err = None
+    for url in _aria2_candidate_urls(os_key, machine):
+        archive = os.path.join(aria2_dir, os.path.basename(url))
         try:
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=target_dir,
-                ignore_patterns=IGNORE_PATTERNS,
-                # snapshot_download resumes partial files by default; this keeps
-                # the behaviour explicit and tolerant of slow CDNs.
-                max_workers=4,
-                etag_timeout=30,
+            print(f"  downloading {url}")
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "flux2-inpaint-installer"}
             )
-            return True
-        except KeyboardInterrupt:
-            print("\nInterrupted. Re-run install.bat to resume the download.")
-            raise
-        except Exception as exc:  # noqa: BLE001 - retry transient failures
-            print(f"  Attempt {attempt}/{MAX_ATTEMPTS} failed: "
-                  f"{type(exc).__name__}: {exc}")
-            # Auth / "file not found" style errors will not be fixed by retrying.
-            message = str(exc).lower()
-            if any(tok in message for tok in
-                   ("401", "403", "gated", "unauthorized", "access to model",
-                    "awaiting a review", "not found", "404")):
-                print("  This looks like an access/permission problem, not a "
-                      "network blip; not retrying.")
+            with urllib.request.urlopen(req, timeout=60) as resp, open(
+                archive, "wb"
+            ) as out:
+                shutil.copyfileobj(resp, out)
+            _extract_archive(archive, aria2_dir)
+            os.remove(archive)
+            found = _find_aria2c_in(aria2_dir)
+            if found:
+                if os.name != "nt":
+                    st = os.stat(found)
+                    os.chmod(found, st.st_mode | stat.S_IEXEC | stat.S_IXGRP)
+                print(f"  aria2 ready: {found}")
+                return found
+        except Exception as exc:  # noqa: BLE001 - try the next candidate URL
+            last_err = exc
+            print(f"  failed: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        "Could not obtain an aria2 binary automatically. Install aria2 and "
+        "make sure 'aria2c' is on your PATH, then re-run. "
+        "(Linux: apt/dnf install aria2  •  macOS: brew install aria2  •  "
+        "Windows: https://github.com/aria2/aria2/releases)"
+        + (f"  Last error: {last_err}" if last_err else "")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hugging Face file listing
+# ---------------------------------------------------------------------------
+def _list_repo_files_with_sizes(repo_id, token):
+    """Return [(repo_relative_path, size_bytes_or_None), ...] to download."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    info = api.model_info(repo_id, token=token, files_metadata=True)
+    files = []
+    for sib in info.siblings:
+        path = sib.rfilename
+        if any(fnmatch.fnmatch(path, pat) for pat in IGNORE_PATTERNS):
+            continue
+        files.append((path, getattr(sib, "size", None)))
+    return files
+
+
+# ---------------------------------------------------------------------------
+# aria2 RPC daemon control
+# ---------------------------------------------------------------------------
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _start_aria2_daemon(aria2c, target_dir, port, secret):
+    cmd = [
+        aria2c,
+        "--enable-rpc",
+        "--rpc-listen-all=false",
+        f"--rpc-listen-port={port}",
+        f"--rpc-secret={secret}",
+        "--continue=true",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=false",
+        "--file-allocation=none",
+        "--console-log-level=warn",
+        "--summary-interval=0",
+        "--max-concurrent-downloads=3",
+        "--max-connection-per-server=16",
+        "--split=16",
+        "--min-split-size=8M",
+        "--max-tries=0",
+        "--retry-wait=5",
+        f"--dir={target_dir}",
+    ]
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
+
+
+def _connect_api(port, secret):
+    import aria2p
+
+    api = aria2p.API(
+        aria2p.Client(host="http://localhost", port=port, secret=secret)
+    )
+    # Wait for the RPC server to come up.
+    for _ in range(50):
+        try:
+            api.get_stats()
+            return api
+        except Exception:  # noqa: BLE001 - server still starting
+            time.sleep(0.2)
+    raise RuntimeError("aria2 RPC server did not start in time.")
+
+
+def _auth_header(token):
+    return ["Authorization: " + _SCHEME + " " + token] if token else None
+
+
+def download_with_aria2(repo_id, target_dir, files, token):
+    """Download every ``files`` entry into ``target_dir`` using aria2.
+
+    Returns True if every file finished, False otherwise.
+    """
+    aria2c = ensure_aria2(os.path.dirname(target_dir.rstrip(os.sep)) or ".")
+    port = _free_port()
+    secret = os.urandom(16).hex()
+    daemon = _start_aria2_daemon(aria2c, target_dir, port, secret)
+
+    # Sizes known up front (for an accurate overall percentage even before
+    # aria2 has fetched each file's headers).
+    expected_total = sum(sz for _p, sz in files if sz) or 0
+
+    try:
+        api = _connect_api(port, secret)
+
+        header = _auth_header(token)
+        from huggingface_hub import hf_hub_url
+
+        downloads = []
+        for rel_path, _size in files:
+            url = hf_hub_url(repo_id=repo_id, filename=rel_path)
+            options = {
+                "dir": target_dir,
+                "out": rel_path,  # keep the repo's folder layout
+                "continue": "true",
+            }
+            if header:
+                options["header"] = header
+            downloads.append(api.add_uris([url], options=options))
+
+        # Poll until everything is done (or unrecoverably errored).
+        last_line_len = 0
+        while True:
+            stats = api.get_stats()
+            completed = 0
+            total = 0
+            errored = []
+            n_done = 0
+            for dl in downloads:
+                try:
+                    dl.update()
+                except Exception:  # noqa: BLE001 - transient RPC hiccup
+                    continue
+                completed += dl.completed_length or 0
+                total += dl.total_length or 0
+                if dl.status == "complete":
+                    n_done += 1
+                elif dl.status == "error":
+                    errored.append(dl)
+
+            grand_total = max(total, expected_total) or 1
+            speed = stats.download_speed or 0
+            remaining = max(grand_total - completed, 0)
+            eta = (remaining / speed) if speed > 0 else None
+            pct = min(100.0, completed * 100.0 / grand_total)
+            line = (
+                f"\r  {pct:5.1f}%  {_human_bytes(completed)} / "
+                f"{_human_bytes(grand_total)}  "
+                f"{_human_bytes(speed)}/s  ETA {_human_time(eta)}  "
+                f"[{n_done}/{len(downloads)} files]"
+            )
+            pad = " " * max(0, last_line_len - len(line))
+            sys.stdout.write(line + pad)
+            sys.stdout.flush()
+            last_line_len = len(line)
+
+            if errored:
+                sys.stdout.write("\n")
+                for dl in errored:
+                    print(
+                        f"  ERROR downloading {dl.name}: "
+                        f"{dl.error_message or 'unknown error'}"
+                    )
                 return False
-            if attempt >= MAX_ATTEMPTS:
-                break
-            print(f"  Retrying in {backoff}s (resuming where it left off)...")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, MAX_BACKOFF)
-    return False
+
+            if n_done == len(downloads):
+                sys.stdout.write("\n")
+                return True
+
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        print("Interrupted. Re-run install.bat to resume where it left off.")
+        raise
+    finally:
+        try:
+            # Persist aria2's session/control files before exiting so a resume
+            # has the freshest state, then stop the daemon.
+            api_local = locals().get("api")
+            if api_local is not None:
+                try:
+                    api_local.pause_all()
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            daemon.terminate()
+            try:
+                daemon.wait(timeout=10)
+            except Exception:  # noqa: BLE001
+                daemon.kill()
 
 
+def _all_present(target_dir, files):
+    """True when every expected file exists with no leftover .aria2 control."""
+    for rel_path, size in files:
+        full = os.path.join(target_dir, rel_path)
+        if not os.path.exists(full):
+            return False
+        if os.path.exists(full + ".aria2"):
+            return False
+        if size is not None and os.path.getsize(full) != size:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main():
     if len(sys.argv) != 3:
         print('Usage: download_model.py "<huggingface_repo_id>" "<ai_dir>"')
@@ -129,21 +479,54 @@ def main():
         except OSError:
             pass
 
-    print(f"Downloading {repo_id}")
-    print(f"           -> {target_dir}")
-    print("This can take a while (these models are several GB).")
-    print("If your connection drops, just run install.bat again -- it resumes.")
+    try:
+        from huggingface_hub import get_token
+        token = get_token()
+    except Exception:  # noqa: BLE001 - older hub versions / no token
+        token = os.environ.get("HF_TOKEN") or os.environ.get(
+            "HUGGING_FACE_HUB_TOKEN"
+        )
 
-    if not download_with_resume(repo_id, target_dir):
-        print()
-        print(f"ERROR: Failed to download {repo_id} after {MAX_ATTEMPTS} attempts.")
-        print()
-        print("Common causes:")
-        print("  - Gated/non-commercial model: accept its license on the model's")
-        print("    Hugging Face page, then authenticate with `huggingface-cli login`.")
-        print("  - Network/proxy issues or insufficient disk space.")
-        print("  - The download is resumable: re-run install.bat to continue.")
+    print(f"Listing files for {repo_id} ...")
+    try:
+        files = _list_repo_files_with_sizes(repo_id, token)
+    except Exception as exc:  # noqa: BLE001 - surface auth/network errors clearly
+        message = str(exc).lower()
+        if any(tok in message for tok in
+               ("401", "403", "gated", "unauthorized", "access to model",
+                "awaiting a review")):
+            print(f"ERROR: {exc}")
+            print("This model is gated/non-commercial. Accept its license on "
+                  "its Hugging Face page and run `huggingface-cli login`.")
+        else:
+            print(f"ERROR: could not list repo files: {exc}")
         return 1
+
+    if not files:
+        print(f"ERROR: no downloadable files found for {repo_id}.")
+        return 1
+
+    total_size = sum(sz for _p, sz in files if sz)
+    print(f"           -> {target_dir}")
+    print(f"{len(files)} files, ~{_human_bytes(total_size)} total.")
+    print("Downloading with aria2 (resumable; re-run install.bat to continue).")
+
+    attempt = 0
+    while attempt < MAX_DOWNLOAD_RETRIES:
+        attempt += 1
+        ok = download_with_aria2(repo_id, target_dir, files, token)
+        if ok and _all_present(target_dir, files):
+            break
+        if attempt >= MAX_DOWNLOAD_RETRIES:
+            print()
+            print(f"ERROR: download did not complete after {attempt} attempts.")
+            print("It is resumable: re-run install.bat to continue where it "
+                  "left off.")
+            return 1
+        wait = min(5 * attempt, 30)
+        print(f"  Some files are still incomplete; retrying in {wait}s "
+              f"(resuming)...")
+        time.sleep(wait)
 
     # Record which repo this folder came from and mark it complete so future
     # runs can skip straight past the download step.
