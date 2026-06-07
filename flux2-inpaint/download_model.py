@@ -39,7 +39,12 @@ sockets. To keep a single bad host from wedging or corrupting an install:
 * Anything aria2 cannot finish is handed to ``huggingface_hub.snapshot_download``
   (native Xet via ``hf_xet``), which downloads to a private temp and only moves
   files into place atomically — it resumes safely, skips already-complete files
-  and **never deletes** data already downloaded.
+  and **never deletes** data already downloaded. Unlike a raw ``urllib`` loop, it
+  rides on pooled ``requests``/``hf_xet`` sessions with built-in retry/backoff, so
+  a single flaky-DNS ``getaddrinfo failed`` no longer aborts the whole install.
+  A watchdog drives aggressive bytes-on-disk progress (percent / speed / ETA) and
+  tightened per-request timeouts so a wedged socket is dropped, retried and
+  reported instead of hanging silently at 0%.
 
 Usage::
 
@@ -325,121 +330,146 @@ def download_with_aria2(repo_id, target_dir, files, token):
         try: daemon.wait(timeout=5)
         except Exception: daemon.kill()
 
-def download_with_robust_fallback(repo_id, target_dir, files, token):
-    """A strictly non-destructive, append-only downloader using hardcoded DNS resolution."""
-    import socket
-    from huggingface_hub import hf_hub_url
-    
-    # Pre-resolve the hostname to an IP to bypass flaky DNS during individual requests
-    hostname = "huggingface.co"
+def _clean_stale_aria2_controls(target_dir, files):
+    """Drop ``<file>.aria2`` controls for files already complete on disk.
+
+    aria2 leaves a small ``<file>.aria2`` control next to every download. Once a
+    file is whole, ``_file_complete`` treats a lingering control as "incomplete",
+    so we remove stale controls (only when the real file is fully present) before
+    handing the rest to the Hugging Face library. The actual data file is never
+    touched.
+    """
+    for rel_path, size in files:
+        full = os.path.join(target_dir, rel_path)
+        ctrl = full + ".aria2"
+        if not os.path.exists(ctrl):
+            continue
+        if os.path.exists(full) and (size is None or os.path.getsize(full) == size):
+            try: os.remove(ctrl)
+            except OSError: pass
+
+def download_with_hf(repo_id, target_dir, files, token):
+    """Non-destructive fallback that finishes leftovers via ``snapshot_download``.
+
+    Unlike a raw ``urllib`` loop (which dies instantly on a single
+    ``getaddrinfo failed`` DNS hiccup), ``huggingface_hub.snapshot_download`` runs
+    on top of pooled ``requests``/``hf_xet`` sessions with built-in retry and
+    exponential backoff, so transient DNS / connection flakes are absorbed and
+    retried instead of aborting the whole install. It downloads into a private
+    temp inside ``target_dir`` and only moves completed files into place, so it
+    resumes safely, skips already-complete files and **never deletes** data
+    already on disk.
+
+    We add what the library does not give on its own:
+
+    * **Aggressive progress** — a watchdog polls bytes-on-disk a few times a
+      minute and prints a single always-moving line (percent, bytes, speed, ETA),
+      so the user is never staring at a frozen 0%.
+    * **Timeout / stall detection** — per-request download and metadata timeouts
+      are tightened so a wedged socket is dropped and retried, and the watchdog
+      warns if no new bytes land within ``STALL_TIMEOUT`` seconds.
+    """
+    import threading
+    from huggingface_hub import snapshot_download
+    from huggingface_hub import constants as hf_constants
+
+    # Tighten timeouts so a silent/half-open socket is dropped and retried by the
+    # library instead of streaming 0 B/s forever. These are read as module
+    # attributes at call time, so patching them here takes effect immediately.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "20")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "15")
     try:
-        # Get the IP once, then use it for all subsequent connections
-        addr_info = socket.getaddrinfo(hostname, 443, socket.AF_INET, socket.SOCK_STREAM)
-        hf_ip = addr_info[0][4][0]
-        print(f"\n  Successfully resolved {hostname} to {hf_ip}. Bypassing DNS for future requests.")
-    except Exception as e:
-        print(f"\n  CRITICAL: Could not resolve {hostname}: {e}")
+        hf_constants.HF_HUB_DOWNLOAD_TIMEOUT = 20
+        hf_constants.HF_HUB_ETAG_TIMEOUT = 15
+    except Exception:
+        pass
+    # We render our own aggregate progress line; silence the library's per-file
+    # tqdm bars so the two don't fight over the terminal.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
+    _clean_stale_aria2_controls(target_dir, files)
+
+    allow = [rel_path for rel_path, _ in files]
+    expected_total = sum(sz for _p, sz in files if sz) or 0
+    result = {"error": None}
+
+    def _worker():
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                local_dir=target_dir,
+                allow_patterns=allow or None,
+                token=token,
+                max_workers=4,
+            )
+        except Exception as exc:  # surfaced to the main thread below
+            result["error"] = exc
+
+    def _on_disk_bytes():
+        total = 0
+        for rel_path, _ in files:
+            try:
+                total += os.path.getsize(os.path.join(target_dir, rel_path))
+            except OSError:
+                pass
+        return total
+
+    print("\n  Falling back to the Hugging Face library (snapshot_download)...")
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    POLL = 3                 # seconds between progress samples
+    STALL_TIMEOUT = 120      # seconds with no new bytes before we warn
+    last_bytes = _on_disk_bytes()
+    last_progress_time = time.time()
+    last_line_len = 0
+    stalled_warned = False
+
+    while worker.is_alive():
+        time.sleep(POLL)
+        now = time.time()
+        cur = _on_disk_bytes()
+        delta = cur - last_bytes
+        speed = delta / POLL if delta > 0 else 0
+        if delta > 0:
+            last_progress_time = now
+            stalled_warned = False
+        last_bytes = cur
+
+        grand_total = max(expected_total, cur) or 1
+        remaining = max(grand_total - cur, 0)
+        eta = (remaining / speed) if speed > 0 else None
+        pct = min(100.0, cur * 100.0 / grand_total)
+        line = (f"\r  {pct:5.1f}%  {_human_bytes(cur)} / {_human_bytes(grand_total)}  "
+                f"{_human_bytes(speed)}/s  ETA {_human_time(eta)}")
+        pad = " " * max(0, last_line_len - len(line))
+        sys.stdout.write(line + pad)
+        sys.stdout.flush()
+        last_line_len = len(line)
+
+        stalled_for = now - last_progress_time
+        if stalled_for >= STALL_TIMEOUT and not stalled_warned:
+            sys.stdout.write(
+                f"\n  WARNING: no new data for {int(stalled_for)}s - the connection looks "
+                f"stalled. The library keeps retrying in the background; if it stays stuck, "
+                f"stop and re-run the installer to resume exactly where it left off.\n")
+            sys.stdout.flush()
+            stalled_warned = True
+
+    worker.join()
+    sys.stdout.write("\n")
+
+    _clean_stale_aria2_controls(target_dir, files)
+
+    if result["error"] is not None:
+        print(f"  Hugging Face fallback error: {result['error']}")
         return False
-
-    socket.setdefaulttimeout(30.0) 
-    
-    print(f"\n  Initiating direct-download fallback (IP: {hf_ip})...")
-    try:
-        for rel_path, expected_size in files:
-            full_path = os.path.join(target_dir, rel_path)
-            aria_ctrl = full_path + ".aria2"
-
-            # Clean ONLY the Aria2 control session block to free the file.
-            # DO NOT DELETE THE 'full_path' FILE CONTAINING ALREADY DOWNLOADED DATA!
-            if os.path.exists(aria_ctrl):
-                try: os.remove(aria_ctrl)
-                except OSError: pass
-
-            url = hf_hub_url(repo_id=repo_id, filename=rel_path)
-            max_attempts = 15
-            
-            for attempt in range(max_attempts):
-                initial_pos = os.path.getsize(full_path) if os.path.exists(full_path) else 0
-                
-                if expected_size and initial_pos == expected_size:
-                    break
-                if expected_size and initial_pos > expected_size:
-                    # Only truncate or wipe if it's somehow larger than the server file
-                    try: os.remove(full_path)
-                    except OSError: pass
-                    initial_pos = 0
-
-                req = urllib.request.Request(url)
-                req.add_header("User-Agent", "flux2-fallback-installer")
-                if token: req.add_header("Authorization", f"{_SCHEME} {token}")
-                
-                # Request ONLY the bytes we don't have yet
-                if initial_pos > 0: 
-                    req.add_header("Range", f"bytes={initial_pos}-")
-
-                try:
-                    with urllib.request.urlopen(req) as resp:
-                        total_size = expected_size
-                        
-                        # Handle content range response properties
-                        status_code = resp.getcode()
-                        is_partial = (status_code == 206)
-                        
-                        if resp.headers.get("Content-Length"):
-                            if is_partial:
-                                total_size = initial_pos + int(resp.headers.get("Content-Length"))
-                            else:
-                                total_size = int(resp.headers.get("Content-Length"))
-                                initial_pos = 0 # Server ignored Range header, starting fresh
-
-                        mode = "ab" if (initial_pos > 0 and is_partial) else "wb"
-                        with open(full_path, mode) as fh:
-                            downloaded = initial_pos
-                            start_time = time.time()
-                            last_line_len = 0
-                            
-                            while True:
-                                chunk = resp.read(1024 * 128)
-                                if not chunk: break
-                                fh.write(chunk)
-                                downloaded += len(chunk)
-
-                                elapsed = time.time() - start_time
-                                speed = (downloaded - initial_pos) / elapsed if elapsed > 0 else 0
-                                pct = (downloaded / total_size * 100) if total_size else 0.0
-
-                                line = f"\r    {pct:5.1f}% | {_human_bytes(downloaded)} / {_human_bytes(total_size) if total_size else '?'} | {_human_bytes(speed)}/s [Resuming: {rel_path}]"
-                                pad = " " * max(0, last_line_len - len(line))
-                                sys.stdout.write(line + pad)
-                                sys.stdout.flush()
-                                last_line_len = len(line)
-                    print() 
-                    break 
-
-                except urllib.error.HTTPError as e:
-                    if e.code == 416:  # Range Not Satisfiable (usually means we are already done)
-                        if expected_size and initial_pos == expected_size:
-                            break
-                        try: os.remove(full_path)
-                        except OSError: pass
-                        continue
-                    if e.code in (401, 403, 404):
-                        print(f"\n    FATAL: HTTP {e.code} for {rel_path}")
-                        return False
-                    print(f"\n    Server issue: {e}. Retrying ({attempt+1}/{max_attempts})...")
-                    time.sleep(3)
-                except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
-                    print(f"\n    Connection dropped/stalled: {e}. Retrying ({attempt+1}/{max_attempts})...")
-                    time.sleep(3)
-                except Exception as e:
-                    print(f"\n    Error: {e}. Retrying ({attempt+1}/{max_attempts})...")
-                    time.sleep(3)
-            else:
-                print(f"\n  ERROR: Failed to download {rel_path} after {max_attempts} fallback attempts.")
-                return False
-        return True
-    finally:
-        socket.setdefaulttimeout(None)
+    return not _missing_files(target_dir, files)
 
 def _file_complete(target_dir, rel_path, size):
     full = os.path.join(target_dir, rel_path)
@@ -512,10 +542,12 @@ def main():
         if attempt >= MAX_DOWNLOAD_RETRIES: break
         time.sleep(2)
 
-    # Check if anything is still missing. If so, drop safely into append-only fallback
+    # Check if anything is still missing. If so, hand the leftovers to the
+    # Hugging Face library (snapshot_download), which has its own retry/backoff
+    # and is far more resilient to flaky DNS than a raw urllib loop.
     todo = _missing_files(target_dir, files)
     if todo:
-        download_with_robust_fallback(repo_id, target_dir, todo, token)
+        download_with_hf(repo_id, target_dir, todo, token)
 
     todo = _missing_files(target_dir, files)
     if todo:
