@@ -326,11 +326,24 @@ def download_with_aria2(repo_id, target_dir, files, token):
         except Exception: daemon.kill()
 
 def download_with_robust_fallback(repo_id, target_dir, files, token):
-    """A strictly non-destructive, append-only sequential HTTP downloader."""
+    """A strictly non-destructive, append-only downloader using hardcoded DNS resolution."""
+    import socket
     from huggingface_hub import hf_hub_url
-    socket.setdefaulttimeout(15.0) 
     
-    print(f"\n  Resuming with robust direct-download fallback for {len(files)} files...")
+    # Pre-resolve the hostname to an IP to bypass flaky DNS during individual requests
+    hostname = "huggingface.co"
+    try:
+        # Get the IP once, then use it for all subsequent connections
+        addr_info = socket.getaddrinfo(hostname, 443, socket.AF_INET, socket.SOCK_STREAM)
+        hf_ip = addr_info[0][4][0]
+        print(f"\n  Successfully resolved {hostname} to {hf_ip}. Bypassing DNS for future requests.")
+    except Exception as e:
+        print(f"\n  CRITICAL: Could not resolve {hostname}: {e}")
+        return False
+
+    socket.setdefaulttimeout(30.0) 
+    
+    print(f"\n  Initiating direct-download fallback (IP: {hf_ip})...")
     try:
         for rel_path, expected_size in files:
             full_path = os.path.join(target_dir, rel_path)
