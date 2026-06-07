@@ -24,6 +24,23 @@ on ``PATH``; otherwise we download the correct prebuilt binary for the user's OS
 (Windows / Linux / macOS) from GitHub into ``ai-model/.aria2`` and reuse it on
 later runs.
 
+Robustness / Hugging Face fallback
+----------------------------------
+aria2 can only reach Hugging Face's Xet HTTP bridge (``cas-bridge.xethub.hf.co``),
+which hands out short-lived signed URLs and is prone to DNS flakiness and dead
+sockets. To keep a single bad host from wedging or corrupting an install:
+
+* aria2 is started with ``--timeout`` / ``--connect-timeout`` /
+  ``--lowest-speed-limit`` so a connection that stalls or goes silent is dropped
+  and retried instead of streaming 0 B/s forever, and the poll loop has its own
+  stall detector that restarts a wedged attempt.
+* Completion is decided by **file size**, so a file already on disk at the right
+  size is never re-downloaded (even if a stale ``.aria2`` control lingers).
+* Anything aria2 cannot finish is handed to ``huggingface_hub.snapshot_download``
+  (native Xet via ``hf_xet``), which downloads to a private temp and only moves
+  files into place atomically — it resumes safely, skips already-complete files
+  and **never deletes** data already downloaded.
+
 Usage::
 
     python download_model.py "<huggingface_repo_id>" "<ai_dir>"
@@ -40,7 +57,6 @@ import sys
 import tarfile
 import time
 import urllib.request
-import urllib.error
 import zipfile
 
 IGNORE_PATTERNS = [
@@ -202,7 +218,15 @@ def _start_aria2_daemon(aria2c, target_dir, port, secret):
         "--allow-overwrite=false", "--file-allocation=none", "--console-log-level=warn",
         "--summary-interval=0", "--max-concurrent-downloads=3", "--max-connection-per-server=16",
         "--split=16", "--min-split-size=8M", "--max-tries=5", "--retry-wait=5",
-        "--async-dns=false", "--max-file-not-found=5", f"--dir={target_dir}",
+        "--async-dns=false", "--max-file-not-found=5",
+        # Anti-hang: the Xet bridge (cas-bridge.xethub.hf.co) frequently accepts a
+        # connection and then sends no data, which would otherwise stream 0 B/s
+        # forever. --timeout drops a connection that delivers no data for 60s,
+        # --connect-timeout bounds the initial handshake, and --lowest-speed-limit
+        # tears down and retries a connection that has gone effectively dead
+        # (sustained < 1 KiB/s) without harming genuinely slow-but-alive links.
+        "--timeout=60", "--connect-timeout=30", "--lowest-speed-limit=1K",
+        f"--dir={target_dir}",
     ]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
@@ -240,6 +264,15 @@ def download_with_aria2(repo_id, target_dir, files, token):
         warned = set()
         last_line_len = 0
         consecutive_rpc_failures = 0
+        # Stall detection: if the total downloaded bytes do not advance at all
+        # for STALL_TIMEOUT seconds while files remain, the attempt is wedged
+        # (e.g. every connection sitting on a dead Xet-bridge socket). Abort so
+        # the outer loop restarts aria2 (resuming from the .aria2 controls) or
+        # hands off to the huggingface_hub fallback. This is the backstop behind
+        # aria2's own per-connection --timeout/--lowest-speed-limit.
+        STALL_TIMEOUT = 150
+        max_completed = 0
+        last_progress_time = time.monotonic()
 
         while True:
             if daemon.poll() is not None:
@@ -273,6 +306,15 @@ def download_with_aria2(repo_id, target_dir, files, token):
                 if consecutive_rpc_failures >= 20: return False
             else:
                 consecutive_rpc_failures = 0
+
+            now = time.monotonic()
+            if completed > max_completed:
+                max_completed = completed
+                last_progress_time = now
+            elif n_done < len(entries) and (now - last_progress_time) > STALL_TIMEOUT:
+                print(f"\n  ERROR: download stalled (no progress for "
+                      f"{STALL_TIMEOUT}s); restarting to resume.")
+                return False
 
             grand_total = max(total, expected_total) or 1
             speed = stats.download_speed or 0
@@ -314,6 +356,10 @@ def download_with_aria2(repo_id, target_dir, files, token):
                     return False
 
                 if requeued:
+                    # Re-queuing resumes a file from its .aria2 control, so its
+                    # reported bytes can briefly dip; give the reconnect room
+                    # before the stall detector can fire.
+                    last_progress_time = time.monotonic()
                     fresh = [p for p in requeued if p not in warned]
                     warned.update(requeued)
                     if fresh:
@@ -341,94 +387,79 @@ def download_with_aria2(repo_id, target_dir, files, token):
 
 def _file_complete(target_dir, rel_path, size):
     full = os.path.join(target_dir, rel_path)
-    if not os.path.exists(full) or os.path.exists(full + ".aria2"): return False
-    if size is not None and os.path.getsize(full) != size: return False
-    return True
+    if not os.path.exists(full):
+        return False
+    ctrl = full + ".aria2"
+    if size is not None:
+        # Size is authoritative. A file at the exact expected size is complete
+        # even if aria2 left a stale control file behind (this happens when the
+        # daemon is terminated the instant a file finishes). Clean the stale
+        # control so the file is recognised as done and never re-downloaded.
+        if os.path.getsize(full) == size:
+            if os.path.exists(ctrl):
+                try: os.remove(ctrl)
+                except OSError: pass
+            return True
+        return False
+    # Size unknown: only trust files with no leftover .aria2 control file.
+    return not os.path.exists(ctrl)
 
 def _missing_files(target_dir, files):
     return [(p, s) for p, s in files if not _file_complete(target_dir, p, s)]
 
-def download_with_robust_fallback(repo_id, target_dir, files, token):
-    """A strictly sequential, timeout-enforced chunked downloader."""
-    from huggingface_hub import hf_hub_url
-    
-    print(f"\n  Initiating robust direct-download fallback for {len(files)} files...")
-    for rel_path, expected_size in files:
-        full_path = os.path.join(target_dir, rel_path)
-        aria_ctrl = full_path + ".aria2"
+def download_with_hf(repo_id, target_dir, files, token):
+    """Finish remaining files with huggingface_hub's snapshot_download.
 
-        # ANTI-CORRUPTION: If aria2 left a control file, the existing data has sparse holes.
-        # We MUST delete it before sequential appending, otherwise the model will be corrupt.
-        if os.path.exists(aria_ctrl):
-            try: os.remove(aria_ctrl)
+    This is the authoritative, Xet-aware path. With ``hf_xet`` installed it
+    speaks Hugging Face's native Xet protocol (not the flaky cas-bridge HTTP
+    proxy aria2 is limited to), and it downloads every file into a private
+    ``.cache/huggingface/download/*.incomplete`` temp, only *atomically* moving
+    it into place once the content is verified. Consequences that matter here:
+
+    * It **never destroys** data already on disk -- unlike the old hand-rolled
+      fallback, there is no ``os.remove`` of a multi-GB partial.
+    * It **resumes** its own partial temps across runs and **skips** files that
+      are already complete, so finished files are never re-downloaded.
+    * It has built-in timeouts and retries, so a dead socket cannot hang it.
+
+    Returns True if every requested file is present afterwards.
+    """
+    from huggingface_hub import snapshot_download
+
+    patterns = [p for p, _ in files]
+    # Remove only stale aria2 *control* files for the handful we are handing off
+    # so huggingface_hub manages these cleanly. We deliberately never delete the
+    # data files themselves: any complete file is preserved, and hf will resume
+    # or atomically replace an incomplete one without losing finished files.
+    for rel_path, _ in files:
+        ctrl = os.path.join(target_dir, rel_path + ".aria2")
+        if os.path.exists(ctrl):
+            try: os.remove(ctrl)
             except OSError: pass
-            if os.path.exists(full_path):
-                try: os.remove(full_path)
-                except OSError: pass
 
-        url = hf_hub_url(repo_id=repo_id, filename=rel_path)
-        max_attempts = 10
-        
-        for attempt in range(max_attempts):
-            initial_pos = os.path.getsize(full_path) if os.path.exists(full_path) else 0
-            if expected_size and initial_pos == expected_size:
-                break
-            if expected_size and initial_pos > expected_size:
-                os.remove(full_path)
-                initial_pos = 0
-
-            req = urllib.request.Request(url)
-            req.add_header("User-Agent", "flux2-fallback-installer")
-            if token: req.add_header("Authorization", f"{_SCHEME} {token}")
-            if initial_pos > 0: req.add_header("Range", f"bytes={initial_pos}-")
-
-            try:
-                # 20-second hard socket timeout prevents infinite stalling
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    total_size = expected_size
-                    if resp.headers.get("Content-Length"):
-                        total_size = initial_pos + int(resp.headers.get("Content-Length"))
-
-                    mode = "ab" if initial_pos > 0 else "wb"
-                    with open(full_path, mode) as fh:
-                        downloaded = initial_pos
-                        start_time = time.time()
-                        last_line_len = 0
-                        
-                        while True:
-                            chunk = resp.read(1024 * 512)
-                            if not chunk: break
-                            fh.write(chunk)
-                            downloaded += len(chunk)
-
-                            elapsed = time.time() - start_time
-                            speed = (downloaded - initial_pos) / elapsed if elapsed > 0 else 0
-                            pct = (downloaded / total_size * 100) if total_size else 0.0
-
-                            line = f"\r    {pct:5.1f}% | {_human_bytes(downloaded)} / {_human_bytes(total_size) if total_size else '?'} | {_human_bytes(speed)}/s [Fallback: {rel_path}]"
-                            pad = " " * max(0, last_line_len - len(line))
-                            sys.stdout.write(line + pad)
-                            sys.stdout.flush()
-                            last_line_len = len(line)
-                print() 
-                break 
-
-            except urllib.error.HTTPError as e:
-                if e.code == 416:  # Range not satisfiable (file likely done or mismatch)
-                    os.remove(full_path)
-                    continue
-                if e.code in (401, 403, 404):
-                    print(f"\n    FATAL: HTTP {e.code} for {rel_path}")
-                    return False
-                print(f"\n    Transient error: {e}. Retrying ({attempt+1}/{max_attempts})...")
-                time.sleep(3)
-            except Exception as e:
-                print(f"\n    Connection error/timeout: {e}. Retrying ({attempt+1}/{max_attempts})...")
-                time.sleep(3)
-        else:
-            print(f"\n  ERROR: Failed to download {rel_path} after {max_attempts} fallback attempts.")
-            return False
-    return True
+    print(f"\n  Finishing {len(files)} file(s) with huggingface_hub "
+          f"(native Xet, safe resume)...")
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                local_dir=target_dir,
+                allow_patterns=patterns,
+                token=token,
+                max_workers=4,
+            )
+        except Exception as exc:  # noqa: BLE001 - classify and retry/report
+            if _is_fatal_error(str(exc)):
+                print(f"  huggingface_hub: fatal error: {exc}")
+                return False
+            wait = min(5 * attempt, 30)
+            print(f"  huggingface_hub: transient error ({exc}); "
+                  f"retry {attempt}/{MAX_DOWNLOAD_RETRIES} in {wait}s...")
+            time.sleep(wait)
+            continue
+        if not _missing_files(target_dir, files):
+            return True
+    return not _missing_files(target_dir, files)
 
 def main():
     if len(sys.argv) != 3:
@@ -499,8 +530,10 @@ def main():
 
     todo = _missing_files(target_dir, files)
     if todo:
-        # Replaces the broken hf_hub_download wrapper completely. 
-        download_with_robust_fallback(repo_id, target_dir, todo, token)
+        # aria2 could not finish these (commonly the Xet bridge stalling/expiring
+        # signed URLs). Hand them to huggingface_hub, which uses the native Xet
+        # protocol, resumes safely and never destroys finished files.
+        download_with_hf(repo_id, target_dir, todo, token)
 
     todo = _missing_files(target_dir, files)
     if todo:
