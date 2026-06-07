@@ -19,15 +19,30 @@ FLUX.2 reference:
 
 import argparse
 import os
+import platform
 import sys
 
-# Ask the CUDA allocator to grow its arenas instead of pre-reserving fixed
-# blocks. This is exactly what the "tried to allocate ... PYTORCH_CUDA_ALLOC_CONF=
-# expandable_segments:True to avoid fragmentation" message recommends, and it
-# meaningfully helps FLUX.2 fit on smaller GPUs. Must be set before torch loads
-# CUDA, so it lives at import time and only fills in a default the user can
-# still override from the environment.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+def _default_cuda_alloc_conf():
+    """Pick a CUDA allocator config that actually works on this OS.
+
+    ``expandable_segments:True`` is the best anti-fragmentation option, but it is
+    **Linux-only** -- on Windows PyTorch prints "expandable_segments not supported
+    on this platform" and ignores it. So we only request it on Linux and fall back
+    to ``max_split_size_mb`` + ``garbage_collection_threshold`` (both cross-platform)
+    elsewhere, which cap fragmentation without the unsupported feature.
+    """
+    if platform.system() == "Linux":
+        return "expandable_segments:True"
+    # Windows / macOS: limit oversized split blocks and let the allocator reclaim
+    # cached memory early once it gets ~80% full. Helps the long-lived GUI that
+    # runs many generations from one loaded pipeline.
+    return "max_split_size_mb:128,garbage_collection_threshold:0.8"
+
+
+# Must be set before torch initialises CUDA, so it happens at import time and only
+# fills in a default the user can still override from the environment.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _default_cuda_alloc_conf())
 
 import torch
 from PIL import Image
@@ -147,6 +162,13 @@ def generate_image(
     if width is not None and height is not None:
         call_kwargs["width"] = width
         call_kwargs["height"] = height
+
+    # The GUI keeps one pipeline loaded and runs many generations, so release any
+    # cached-but-unused blocks from the previous run before this one. This hands
+    # fragmented reserved memory back to the allocator and is the cheapest way to
+    # avoid a slow creep toward OOM over a long painting session.
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     try:
         result = pipe(**call_kwargs).images[0]
