@@ -200,20 +200,26 @@ echo Installing FLUX.2 dependencies...
 :: FLUX.2 pipelines (Flux2Pipeline / Flux2KleinPipeline) currently live on
 :: diffusers main, and the klein text encoder needs a recent transformers.
 :: Each group is skipped when it already imports, so re-running is cheap.
-python -c "import diffusers" >nul 2>&1
+:: Verify the actual FLUX.2 pipeline classes import (not just "import diffusers"),
+:: so a stale diffusers without Flux2KleinPipeline is upgraded instead of skipped.
+python -c "from diffusers import Flux2Pipeline, Flux2KleinPipeline" >nul 2>&1
 if not errorlevel 1 (
     echo diffusers already installed; skipping.
 ) else (
-    set "PIP_ARGS=install git+https://github.com/huggingface/diffusers.git"
+    set "PIP_ARGS=install -U git+https://github.com/huggingface/diffusers.git"
     call :pip_retry
     if errorlevel 1 goto :deps_failed
 )
 
-python -c "import transformers, accelerate, safetensors, huggingface_hub, PIL" >nul 2>&1
+:: The klein text encoder is Qwen3 (Qwen3ForCausalLM), which only exists in recent
+:: transformers. Importing that class -- not just "import transformers" -- makes a
+:: stale transformers get upgraded; otherwise generation fails at run time with
+:: "could not import Qwen3ForCausalLM".
+python -c "import accelerate, safetensors, huggingface_hub, PIL; from transformers import Qwen3ForCausalLM" >nul 2>&1
 if not errorlevel 1 (
     echo Core dependencies already installed; skipping.
 ) else (
-    set "PIP_ARGS=install transformers accelerate safetensors huggingface_hub Pillow"
+    set "PIP_ARGS=install -U transformers accelerate safetensors huggingface_hub Pillow"
     call :pip_retry
     if errorlevel 1 goto :deps_failed
 )
