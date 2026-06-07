@@ -1,4 +1,4 @@
-"""Download a FLUX.2 model from Hugging Face using aria2 (via aria2p).
+"""Download a FLUX.2 model from Hugging Face using aria2 (batch input file).
 
 Why aria2 instead of ``snapshot_download``?
 ------------------------------------------
@@ -8,14 +8,16 @@ files streamed into hidden ``*.incomplete`` blobs in the HF cache, so users who
 pay per gigabyte could not tell whether anything was happening or how much was
 left. aria2 fixes all of that:
 
-* **Consistent progress** — we drive aria2 over its JSON-RPC interface with
-  ``aria2p`` and print a single, always-moving line with overall percent, bytes
-  downloaded / total, speed and ETA.
-* **Reliable resume** — every file is downloaded straight into the local model
-  directory with ``--continue``. aria2 keeps a small ``<file>.aria2`` control
-  file next to each download, so if the connection drops (or you close the
-  window) re-running ``install.bat`` picks up *exactly* where it left off and
-  never re-downloads a byte it already has.
+* **Consistent progress** — we run ``aria2c`` on a generated *batch input file*
+  (the padeoe/hfd.sh technique) and a watchdog samples bytes-on-disk to print a
+  single, always-moving line with overall percent, bytes downloaded / total,
+  speed and ETA (plus a stall warning if data stops flowing).
+* **Reliable resume** — the input file is run with ``--continue`` /
+  ``--save-session``, and every file is downloaded straight into the local model
+  directory. aria2 keeps a small ``<file>.aria2`` control file next to each
+  download, so if the connection drops (or you close the window) re-running
+  ``install.bat`` picks up *exactly* where it left off and never re-downloads a
+  byte it already has.
 * **No hidden blobs** — files land at their real paths inside ``model/`` (e.g.
   ``model/text_encoder/model.safetensors``), not as opaque cache hashes.
 
@@ -51,13 +53,10 @@ Usage::
     python download_model.py "<huggingface_repo_id>" "<ai_dir>"
 """
 
-"""Download a FLUX.2 model from Hugging Face using aria2 with non-destructive fallback."""
-
 import fnmatch
 import os
 import platform
 import shutil
-import socket
 import stat
 import subprocess
 import sys
@@ -208,127 +207,180 @@ def _list_repo_files_with_sizes(repo_id, token):
     from huggingface_hub import HfApi
     api = HfApi()
     info = api.model_info(repo_id, token=token, files_metadata=True)
+    # hfd.sh-style auth detection: a gated repo without a token will never
+    # download, so fail early with an actionable message instead of a confusing
+    # mid-download 401/403.
+    gated = getattr(info, "gated", False)
+    if gated and not token:
+        raise RuntimeError(
+            f"Repository '{repo_id}' is gated (access-restricted) and no Hugging Face "
+            f"token was found. Request access at https://huggingface.co/{repo_id} then run "
+            f"`huggingface-cli login` (or set HF_TOKEN).")
     files = []
     for sib in info.siblings:
         if any(fnmatch.fnmatch(sib.rfilename, pat) for pat in IGNORE_PATTERNS): continue
         files.append((sib.rfilename, getattr(sib, "size", None)))
     return files
 
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+ARIA2_THREADS = 4       # connections per file (aria2 -x / -s)
+ARIA2_CONCURRENT = 5    # files downloaded at once (aria2 -j)
 
-def _start_aria2_daemon(aria2c, target_dir, port, secret):
-    cmd = [
-        aria2c, "--enable-rpc", "--rpc-listen-all=false", f"--rpc-listen-port={port}",
-        f"--rpc-secret={secret}", "--continue=true", "--auto-file-renaming=false",
-        "--allow-overwrite=false", "--file-allocation=none", "--console-log-level=warn",
-        "--summary-interval=0", "--max-concurrent-downloads=3", "--max-connection-per-server=16",
-        "--split=16", "--min-split-size=8M", "--max-tries=5", "--retry-wait=5",
-        "--lowest-speed-limit=50K", "--timeout=15",
-        "--async-dns=false", "--max-file-not-found=5", f"--dir={target_dir}",
-    ]
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+def _build_aria2_input_file(repo_id, target_dir, files, token, list_path):
+    """Write an aria2c batch *input file* (the padeoe/hfd.sh technique).
 
-def _connect_api(port, secret):
-    import aria2p
-    api = aria2p.API(aria2p.Client(host="http://localhost", port=port, secret=secret))
-    for _ in range(50):
-        try:
-            api.get_stats()
-            return api
-        except Exception:
-            time.sleep(0.2)
-    raise RuntimeError("aria2 RPC server did not start.")
+    Each file becomes a URL line followed by indented ``dir=`` / ``out=`` options
+    (plus an ``Authorization`` ``header=`` when a token is set). aria2c consumes
+    this with ``-i`` and, combined with ``--continue`` + ``--save-session``,
+    resumes every file byte-for-byte across re-runs — the reliable "pick it up
+    where it left off" behaviour the per-URI RPC approach failed to deliver. Each
+    file lands at its real subpath under ``target_dir`` (never a hidden blob).
+    """
+    from huggingface_hub import hf_hub_url
+    lines = []
+    for rel_path, _sz in files:
+        url = hf_hub_url(repo_id=repo_id, filename=rel_path)
+        rel_dir = os.path.dirname(rel_path)
+        out_dir = os.path.join(target_dir, rel_dir) if rel_dir else target_dir
+        lines.append(url)
+        lines.append(f"  dir={out_dir}")
+        lines.append(f"  out={os.path.basename(rel_path)}")
+        if token:
+            lines.append(f"  header=Authorization: {_SCHEME} {token}")
+        lines.append("")
+    with open(list_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 def download_with_aria2(repo_id, target_dir, files, token):
-    aria2c = ensure_aria2(os.path.dirname(target_dir.rstrip(os.sep)) or ".")
-    port, secret = _free_port(), os.urandom(16).hex()
-    daemon = _start_aria2_daemon(aria2c, target_dir, port, secret)
+    """Download via aria2c's batch input-file mode, adapted from padeoe/hfd.sh.
+
+    We generate an aria2 input file and run ``aria2c -c -i <list>
+    --save-session=<list>`` as a plain subprocess. aria2 handles its own
+    multi-connection download, retries and reconnects, and ``--continue`` /
+    ``--save-session`` make an interrupted run resume exactly where it stopped on
+    the next launch. A background watchdog samples bytes-on-disk to render
+    aggressive aggregate progress (percent / speed / ETA) and to flag stalls, and
+    on a non-zero exit we print the tail of aria2's own log so the *real* cause is
+    visible instead of a silent failure. Completion is decided by on-disk file
+    size (see ``_missing_files``), so a file already fully present is never
+    re-fetched and nothing already downloaded is ever deleted.
+    """
+    ai_root = os.path.dirname(target_dir.rstrip(os.sep)) or "."
+    aria2c = ensure_aria2(ai_root)
+
+    hfd_dir = os.path.join(target_dir, ".hfd")
+    os.makedirs(hfd_dir, exist_ok=True)
+    list_path = os.path.join(hfd_dir, "aria2_urls.txt")
+    log_path = os.path.join(hfd_dir, "aria2_log.txt")
+
+    # A control file lingering next to a *whole* file would make aria2 re-stat it;
+    # clear only those stale controls (never the data file itself).
+    _clean_stale_aria2_controls(target_dir, files)
+    _build_aria2_input_file(repo_id, target_dir, files, token, list_path)
+
     expected_total = sum(sz for _p, sz in files if sz) or 0
 
-    try:
-        api = _connect_api(port, secret)
-        header = ["Authorization: " + _SCHEME + " " + token] if token else None
-        from huggingface_hub import hf_hub_url
+    cmd = [
+        aria2c,
+        "--console-log-level=warn",
+        "--file-allocation=none",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=false",
+        "--continue=true",
+        "-x", str(ARIA2_THREADS),
+        "-j", str(ARIA2_CONCURRENT),
+        "-s", str(ARIA2_THREADS),
+        "-k", "1M",
+        "--max-tries=5",
+        "--retry-wait=5",
+        "--timeout=15",
+        "--connect-timeout=15",
+        "--lowest-speed-limit=30K",
+        "--max-file-not-found=5",
+        "--summary-interval=0",
+        "-i", list_path,
+        "--save-session", list_path,
+    ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
-        def _add_download(rel_path):
-            url = hf_hub_url(repo_id=repo_id, filename=rel_path)
-            options = {"dir": target_dir, "out": rel_path, "continue": "true"}
-            if header: options["header"] = header
-            return api.add_uris([url], options=options)
-
-        entries = [[rel_path, _add_download(rel_path)] for rel_path, _ in files]
-        file_retries = {}
-        last_line_len = 0
-        consecutive_rpc_failures = 0
-
-        while True:
-            if daemon.poll() is not None:
-                return False
-
+    def _on_disk_bytes():
+        total = 0
+        for rel_path, _ in files:
             try:
-                stats = api.get_stats()
-            except Exception:
-                consecutive_rpc_failures += 1
-                if consecutive_rpc_failures >= 20: return False
-                time.sleep(0.5)
-                continue
+                total += os.path.getsize(os.path.join(target_dir, rel_path))
+            except OSError:
+                pass
+        return total
 
-            completed, total, n_done, update_failures, errored = 0, 0, 0, 0, []
-            for entry in entries:
-                dl = entry[1]
-                try: dl.update()
-                except Exception:
-                    update_failures += 1
-                    continue
-                completed += dl.completed_length or 0
-                total += dl.total_length or 0
-                if dl.status == "complete": n_done += 1
-                elif dl.status == "error": errored.append(entry)
+    print(f"\n  Downloading with aria2c (batch input file, resumable; "
+          f"{ARIA2_THREADS} conn/file x {ARIA2_CONCURRENT} files)...")
 
-            if update_failures >= len(entries) and entries:
-                consecutive_rpc_failures += 1
-                if consecutive_rpc_failures >= 20: return False
-            else:
-                consecutive_rpc_failures = 0
+    POLL = 2                 # seconds between progress samples
+    STALL_TIMEOUT = 90       # seconds with no new bytes before we warn
+    last_line_len = 0
 
-            grand_total = max(total, expected_total) or 1
-            speed = stats.download_speed or 0
-            remaining = max(grand_total - completed, 0)
-            eta = (remaining / speed) if speed > 0 else None
-            pct = min(100.0, completed * 100.0 / grand_total)
-            
-            line = f"\r  {pct:5.1f}%  {_human_bytes(completed)} / {_human_bytes(grand_total)}  {_human_bytes(speed)}/s  ETA {_human_time(eta)}  [{n_done}/{len(entries)} files]"
-            pad = " " * max(0, last_line_len - len(line))
-            sys.stdout.write(line + pad)
-            sys.stdout.flush()
-            last_line_len = len(line)
+    with open(log_path, "w", encoding="utf-8") as logfh:
+        proc = subprocess.Popen(cmd, stdout=logfh, stderr=subprocess.STDOUT,
+                                creationflags=creationflags)
+        last_bytes = _on_disk_bytes()
+        last_progress_time = time.time()
+        stalled_warned = False
+        try:
+            while proc.poll() is None:
+                time.sleep(POLL)
+                now = time.time()
+                cur = _on_disk_bytes()
+                delta = cur - last_bytes
+                speed = delta / POLL if delta > 0 else 0
+                if delta > 0:
+                    last_progress_time = now
+                    stalled_warned = False
+                last_bytes = cur
 
-            if errored:
-                # If Aria2 encounters errors (often due to post-crash state control files matching errors), 
-                # we return False so the script can smoothly fallback or cleanly restart without wiping data.
-                sys.stdout.write("\n")
-                return False
+                grand_total = max(expected_total, cur) or 1
+                remaining = max(grand_total - cur, 0)
+                eta = (remaining / speed) if speed > 0 else None
+                pct = min(100.0, cur * 100.0 / grand_total)
+                line = (f"\r  {pct:5.1f}%  {_human_bytes(cur)} / {_human_bytes(grand_total)}  "
+                        f"{_human_bytes(speed)}/s  ETA {_human_time(eta)}")
+                pad = " " * max(0, last_line_len - len(line))
+                sys.stdout.write(line + pad)
+                sys.stdout.flush()
+                last_line_len = len(line)
 
-            if n_done == len(entries):
-                sys.stdout.write("\n")
-                return True
-            time.sleep(0.5)
+                stalled_for = now - last_progress_time
+                if stalled_for >= STALL_TIMEOUT and not stalled_warned:
+                    sys.stdout.write(
+                        f"\n  WARNING: no new data for {int(stalled_for)}s - the connection "
+                        f"looks stalled. aria2 keeps retrying in the background; you can also "
+                        f"stop and re-run the installer to resume exactly where it left off.\n")
+                    sys.stdout.flush()
+                    stalled_warned = True
+        except KeyboardInterrupt:
+            proc.terminate()
+            try: proc.wait(timeout=5)
+            except Exception: proc.kill()
+            sys.stdout.write("\n")
+            raise
 
-    except KeyboardInterrupt:
-        sys.stdout.write("\n")
-        raise
-    finally:
-        api_local = locals().get("api")
-        if api_local:
-            try: api_local.pause_all()
-            except Exception: pass
-        daemon.terminate()
-        try: daemon.wait(timeout=5)
-        except Exception: daemon.kill()
+    sys.stdout.write("\n")
+    _clean_stale_aria2_controls(target_dir, files)
+
+    rc = proc.returncode
+    still_missing = _missing_files(target_dir, files)
+    if rc != 0 and still_missing:
+        # Surface the real cause from aria2's own log instead of failing silently.
+        tail = ""
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as logfh:
+                tail = "".join(logfh.readlines()[-5:]).strip()
+        except OSError:
+            pass
+        print(f"  aria2c exited with code {rc}; {len(still_missing)} file(s) still incomplete.")
+        if tail:
+            print("  Last aria2c messages:")
+            for ln in tail.splitlines():
+                print(f"    {ln}")
+    return not still_missing
 
 def _clean_stale_aria2_controls(target_dir, files):
     """Drop ``<file>.aria2`` controls for files already complete on disk.
