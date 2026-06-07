@@ -85,6 +85,27 @@ MAX_DOWNLOAD_RETRIES = 6
 # token is never inlined into a format string in source).
 _SCHEME = "Bea" "rer"
 
+# Substrings (matched case-insensitively against aria2's error message) that
+# mark an error as *fatal* -- i.e. retrying cannot help. These are things like
+# authentication / permission / missing-file problems. Anything not matching is
+# treated as transient (network, DNS, timeout, rate-limit, 5xx) and retried.
+_FATAL_ERROR_HINTS = (
+    "401", "403", "404", "410", "unauthorized", "forbidden",
+    "not found", "no such file", "gated", "access to model",
+    "authentication", "permission",
+)
+
+
+def _is_fatal_error(message):
+    """True when an aria2 error message indicates an unrecoverable failure.
+
+    Transient problems (DNS resolution against the Xet bridge, connection
+    resets, timeouts, 429/5xx) return False so the caller keeps retrying with
+    aria2 rather than abandoning the download to the progress-less fallback.
+    """
+    msg = (message or "").lower()
+    return any(hint in msg for hint in _FATAL_ERROR_HINTS)
+
 
 # ---------------------------------------------------------------------------
 # Pretty-printing helpers
@@ -402,12 +423,16 @@ def download_with_aria2(repo_id, target_dir, files, token):
         # fresh Download object when a file is re-queued after a transient error.
         entries = [[rel_path, _add_download(rel_path)] for rel_path, _ in files]
 
-        # Per-file retry budget for transient errors (e.g. DNS failures against
-        # the Xet bridge). Once a file exhausts it we stop and let the caller
-        # fall back to the official Hugging Face downloader, which speaks the
-        # Xet protocol directly instead of via the flaky HTTP bridge.
+        # Per-file retry counter. Transient errors (above all the flaky DNS for
+        # the Xet bridge cas-bridge.xethub.hf.co) are retried with aria2
+        # *indefinitely* so the file finishes here, with the live progress bar,
+        # exactly the way the first several gigabytes did. We deliberately do
+        # NOT bail out to the official Hugging Face downloader on these: that
+        # path shows no progress bar and, when DNS is the problem, fails on the
+        # very same host while spamming the console. We only give up on aria2
+        # for genuinely fatal errors (auth / not-found), which no amount of
+        # retrying can fix and which the HF client can report more helpfully.
         file_retries = {}
-        max_file_retries = 4
         warned = set()
 
         # Poll until everything is done (or unrecoverably errored).
@@ -484,21 +509,24 @@ def download_with_aria2(repo_id, target_dir, files, token):
 
             if errored:
                 # A single file failing (commonly a transient DNS error against
-                # the Xet CDN) should not throw away the gigabytes already
-                # fetched for the other files. Re-queue each errored file in
-                # place; only give up on a file once it exhausts its retry
-                # budget, and only fail the whole attempt then.
+                # the Xet bridge) should not throw away the gigabytes already
+                # fetched for the other files, nor abandon aria2 (and its
+                # progress bar) for the progress-less fallback. Re-queue every
+                # transient failure in place and keep retrying it with aria2;
+                # only treat genuinely fatal errors (auth / not-found) as fatal.
                 fatal = []
                 requeued = []
                 for entry in errored:
                     rel_path, dl = entry
                     n = file_retries.get(rel_path, 0) + 1
                     file_retries[rel_path] = n
-                    if n > max_file_retries:
+                    if _is_fatal_error(dl.error_message):
                         fatal.append((rel_path, dl.error_message))
                         continue
                     # Drop the errored result (keeping the partial file and its
-                    # .aria2 control) and resubmit so aria2 resumes it.
+                    # .aria2 control) and resubmit so aria2 resumes it. Re-adding
+                    # re-resolves the URL, refreshing the Xet bridge's signed
+                    # token and following a fresh DNS lookup.
                     try:
                         api.remove([dl], force=True, files=False, clean=True)
                     except Exception:  # noqa: BLE001 - best effort cleanup
@@ -507,7 +535,13 @@ def download_with_aria2(repo_id, target_dir, files, token):
                         entry[1] = _add_download(rel_path)
                         requeued.append(rel_path)
                     except Exception as exc:  # noqa: BLE001 - resubmit failed
-                        fatal.append((rel_path, str(exc)))
+                        # A failure to even submit the request is itself usually
+                        # transient (the local RPC hiccupping); keep retrying
+                        # unless it looks fatal.
+                        if _is_fatal_error(str(exc)):
+                            fatal.append((rel_path, str(exc)))
+                        else:
+                            requeued.append(rel_path)
 
                 if fatal:
                     sys.stdout.write("\n")
@@ -521,7 +555,7 @@ def download_with_aria2(repo_id, target_dir, files, token):
                 if requeued:
                     # Only announce files we have not already warned about, so a
                     # persistently failing host does not spam an identical line
-                    # every poll. Exhausted files drop through to the fallback.
+                    # every poll.
                     fresh = [p for p in requeued if p not in warned]
                     warned.update(requeued)
                     if fresh:
@@ -531,9 +565,18 @@ def download_with_aria2(repo_id, target_dir, files, token):
                         more = " ..." if len(fresh) > 3 else ""
                         print(
                             f"  Transient error on {len(fresh)} file(s) "
-                            f"(e.g. DNS to the Xet bridge); resuming: "
-                            f"{shown}{more}"
+                            f"(e.g. DNS to the Xet bridge); retrying with "
+                            f"aria2: {shown}{more}"
                         )
+                    # Back off before re-hammering a flaky host. Scale the wait
+                    # with how many times these files have already retried (DNS
+                    # for the Xet bridge can be down for a while), capped so the
+                    # progress bar resumes promptly once the host recovers.
+                    backoff = min(
+                        2 + max(file_retries.get(p, 1) for p in requeued),
+                        30,
+                    )
+                    time.sleep(backoff)
 
             if n_done == len(entries):
                 sys.stdout.write("\n")
@@ -703,13 +746,15 @@ def main():
               f"(resuming)...")
         time.sleep(wait)
 
-    # Whatever aria2 could not finish (commonly Xet-bridge DNS/expiry issues),
-    # complete with the official, Xet-aware Hugging Face downloader.
+    # aria2 now retries transient Xet-bridge DNS/network errors itself (with the
+    # progress bar), so it should finish on its own. This fallback only runs for
+    # the rare cases aria2 surfaced as fatal (auth/not-found) or where its daemon
+    # died -- a last resort using the official, Xet-aware Hugging Face client.
     todo = _missing_files(target_dir, files)
     if todo:
         print()
         print(f"Finishing {len(todo)} file(s) with the official Hugging Face "
-              "downloader (handles Xet directly)...")
+              "downloader as a last resort (handles Xet directly)...")
         try:
             download_with_hf(repo_id, target_dir, todo, token)
         except Exception as exc:  # noqa: BLE001 - surface but fall through
