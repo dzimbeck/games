@@ -297,8 +297,17 @@ def _start_aria2_daemon(aria2c, target_dir, port, secret):
         "--max-connection-per-server=16",
         "--split=16",
         "--min-split-size=8M",
-        "--max-tries=0",
+        "--max-tries=5",
         "--retry-wait=5",
+        # Use the operating system's resolver (getaddrinfo) instead of aria2's
+        # built-in c-ares async DNS. Hugging Face redirects large files to its
+        # Xet CDN (cas-bridge.xethub.hf.co); c-ares often reports
+        # "Name resolution ... could not contact dns server" for that host even
+        # when the OS can resolve it, killing the download. The system resolver
+        # respects /etc/resolv.conf, /etc/hosts and OS DNS caching.
+        "--async-dns=false",
+        # Don't treat a transient HTTP 404 from the redirect target as fatal.
+        "--max-file-not-found=5",
         f"--dir={target_dir}",
     ]
     creationflags = 0
@@ -352,8 +361,13 @@ def download_with_aria2(repo_id, target_dir, files, token):
         header = _auth_header(token)
         from huggingface_hub import hf_hub_url
 
-        downloads = []
-        for rel_path, _size in files:
+        def _add_download(rel_path):
+            """(Re-)submit a single file to aria2, returning the Download.
+
+            Re-resolving the URL on every (re)try is deliberate: it follows a
+            fresh redirect to Hugging Face's Xet CDN, refreshing any short-lived
+            signed token so a resumed/retried file does not fail on a stale one.
+            """
             url = hf_hub_url(repo_id=repo_id, filename=rel_path)
             options = {
                 "dir": target_dir,
@@ -362,7 +376,17 @@ def download_with_aria2(repo_id, target_dir, files, token):
             }
             if header:
                 options["header"] = header
-            downloads.append(api.add_uris([url], options=options))
+            return api.add_uris([url], options=options)
+
+        # Each entry is a mutable [rel_path, Download] pair so we can swap in a
+        # fresh Download object when a file is re-queued after a transient error.
+        entries = [[rel_path, _add_download(rel_path)] for rel_path, _ in files]
+
+        # Per-file retry budget for transient errors (e.g. DNS failures against
+        # the Xet CDN). Exceeding it for any single file fails the attempt; the
+        # outer retry loop in main() then resumes from the control files.
+        file_retries = {}
+        max_file_retries = 12
 
         # Poll until everything is done (or unrecoverably errored).
         last_line_len = 0
@@ -393,7 +417,8 @@ def download_with_aria2(repo_id, target_dir, files, token):
             errored = []
             n_done = 0
             update_failures = 0
-            for dl in downloads:
+            for entry in entries:
+                dl = entry[1]
                 try:
                     dl.update()
                 except Exception:  # noqa: BLE001 - transient per-download hiccup
@@ -404,12 +429,12 @@ def download_with_aria2(repo_id, target_dir, files, token):
                 if dl.status == "complete":
                     n_done += 1
                 elif dl.status == "error":
-                    errored.append(dl)
+                    errored.append(entry)
 
             # Healthy poll (stats worked and at least one download updated)
             # resets the failure counter; an all-failed poll counts toward the
             # abort threshold so a persistently broken RPC is detected.
-            if update_failures >= len(downloads) and downloads:
+            if update_failures >= len(entries) and entries:
                 consecutive_rpc_failures += 1
                 if consecutive_rpc_failures >= max_rpc_failures:
                     sys.stdout.write("\n")
@@ -428,7 +453,7 @@ def download_with_aria2(repo_id, target_dir, files, token):
                 f"\r  {pct:5.1f}%  {_human_bytes(completed)} / "
                 f"{_human_bytes(grand_total)}  "
                 f"{_human_bytes(speed)}/s  ETA {_human_time(eta)}  "
-                f"[{n_done}/{len(downloads)} files]"
+                f"[{n_done}/{len(entries)} files]"
             )
             pad = " " * max(0, last_line_len - len(line))
             sys.stdout.write(line + pad)
@@ -436,15 +461,52 @@ def download_with_aria2(repo_id, target_dir, files, token):
             last_line_len = len(line)
 
             if errored:
-                sys.stdout.write("\n")
-                for dl in errored:
-                    print(
-                        f"  ERROR downloading {dl.name}: "
-                        f"{dl.error_message or 'unknown error'}"
-                    )
-                return False
+                # A single file failing (commonly a transient DNS error against
+                # the Xet CDN) should not throw away the gigabytes already
+                # fetched for the other files. Re-queue each errored file in
+                # place; only give up on a file once it exhausts its retry
+                # budget, and only fail the whole attempt then.
+                fatal = []
+                requeued = []
+                for entry in errored:
+                    rel_path, dl = entry
+                    n = file_retries.get(rel_path, 0) + 1
+                    file_retries[rel_path] = n
+                    if n > max_file_retries:
+                        fatal.append((rel_path, dl.error_message))
+                        continue
+                    # Drop the errored result (keeping the partial file and its
+                    # .aria2 control) and resubmit so aria2 resumes it.
+                    try:
+                        api.remove([dl], force=True, files=False, clean=True)
+                    except Exception:  # noqa: BLE001 - best effort cleanup
+                        pass
+                    try:
+                        entry[1] = _add_download(rel_path)
+                        requeued.append(rel_path)
+                    except Exception as exc:  # noqa: BLE001 - resubmit failed
+                        fatal.append((rel_path, str(exc)))
 
-            if n_done == len(downloads):
+                if fatal:
+                    sys.stdout.write("\n")
+                    for rel_path, msg in fatal:
+                        print(
+                            f"  ERROR downloading {rel_path}: "
+                            f"{msg or 'unknown error'}"
+                        )
+                    return False
+
+                if requeued:
+                    last_line_len = 0
+                    sys.stdout.write("\n")
+                    shown = ", ".join(requeued[:3])
+                    more = " ..." if len(requeued) > 3 else ""
+                    print(
+                        f"  Transient error on {len(requeued)} file(s) "
+                        f"(e.g. DNS); resuming: {shown}{more}"
+                    )
+
+            if n_done == len(entries):
                 sys.stdout.write("\n")
                 return True
 
