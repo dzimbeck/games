@@ -29,11 +29,12 @@ again:
 
 - Steps that already finished are detected and skipped — pyenv, Python, the
   virtual environment and any Python packages that already import are left as-is.
-- The model download is handled by **aria2** (driven through `aria2p`) for a
-  consistent, always-moving progress line (percent, downloaded / total, speed,
-  ETA). Each file is written straight into `ai-model/model/` with a small
-  `<file>.aria2` control file beside it, so a dropped connection or a closed
-  window **resumes from the exact byte it stopped at** — it never re-downloads
+- The model download is handled by **aria2** (the `aria2c` binary run on a
+  generated batch input file) for a consistent, always-moving progress line
+  (percent, downloaded / total, speed, ETA). Each file is written straight into
+  `ai-model/model/` with a small `<file>.aria2` control file beside it, so a
+  dropped connection or a closed window **resumes from the exact byte it stopped
+  at** — it never re-downloads
   data you already have (important if you pay per gigabyte) and never leaves
   giant hidden cache blobs. A `DOWNLOAD_COMPLETE` marker is written once the
   model is fully present so future runs skip the download entirely.

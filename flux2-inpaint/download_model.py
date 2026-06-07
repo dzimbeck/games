@@ -586,8 +586,8 @@ def main():
         todo = _missing_files(target_dir, files)
         if not todo: break
         attempt += 1
-        
-        # Aria2 block execution
+
+        # Primary path: aria2c batch input-file download (resumable via --continue)
         download_with_aria2(repo_id, target_dir, todo, token)
 
         if not _missing_files(target_dir, files): break

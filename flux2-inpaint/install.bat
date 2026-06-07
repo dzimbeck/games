@@ -209,11 +209,11 @@ if not errorlevel 1 (
     if errorlevel 1 goto :deps_failed
 )
 
-python -c "import transformers, accelerate, safetensors, huggingface_hub, aria2p, PIL" >nul 2>&1
+python -c "import transformers, accelerate, safetensors, huggingface_hub, PIL" >nul 2>&1
 if not errorlevel 1 (
     echo Core dependencies already installed; skipping.
 ) else (
-    set "PIP_ARGS=install transformers accelerate safetensors huggingface_hub aria2p Pillow"
+    set "PIP_ARGS=install transformers accelerate safetensors huggingface_hub Pillow"
     call :pip_retry
     if errorlevel 1 goto :deps_failed
 )
