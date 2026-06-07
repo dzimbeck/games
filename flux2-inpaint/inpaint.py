@@ -18,7 +18,16 @@ FLUX.2 reference:
 """
 
 import argparse
+import os
 import sys
+
+# Ask the CUDA allocator to grow its arenas instead of pre-reserving fixed
+# blocks. This is exactly what the "tried to allocate ... PYTORCH_CUDA_ALLOC_CONF=
+# expandable_segments:True to avoid fragmentation" message recommends, and it
+# meaningfully helps FLUX.2 fit on smaller GPUs. Must be set before torch loads
+# CUDA, so it lives at import time and only fills in a default the user can
+# still override from the environment.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from PIL import Image
@@ -76,6 +85,15 @@ def load_pipeline(model_dir, pipeline_kind, mode):
         # offload + quant both stream components between CPU and GPU as needed.
         pipe.enable_model_cpu_offload()
 
+    # Decode the latents in tiles/slices instead of all at once. The VAE decode
+    # is a major source of the end-of-run memory spike, so this keeps generation
+    # within budget on 12 GB cards (and is harmless on larger ones). Guarded with
+    # hasattr because not every diffusers build exposes both helpers.
+    if hasattr(pipe, "enable_vae_tiling"):
+        pipe.enable_vae_tiling()
+    if hasattr(pipe, "enable_vae_slicing"):
+        pipe.enable_vae_slicing()
+
     return pipe
 
 
@@ -130,7 +148,21 @@ def generate_image(
         call_kwargs["width"] = width
         call_kwargs["height"] = height
 
-    result = pipe(**call_kwargs).images[0]
+    try:
+        result = pipe(**call_kwargs).images[0]
+    except torch.cuda.OutOfMemoryError as exc:
+        torch.cuda.empty_cache()
+        raise torch.cuda.OutOfMemoryError(
+            f"{exc}\n\n"
+            "FLUX.2 ran out of GPU memory. On a 12 GB card the model does not fit "
+            "fully resident, so use streaming CPU offload instead of full-GPU mode:\n"
+            "  * GUI / CLI: add  --mode offload  (re-run install.bat and enter 8-11 "
+            "for your VRAM to regenerate the launchers with offload), or\n"
+            "  * shrink the generated region (fewer/larger tiles) so each run is "
+            "smaller.\n"
+            "Offload keeps only the active model component on the GPU and trades a "
+            "little speed for fitting in 12 GB."
+        ) from exc
 
     if mask is not None:
         if base_image is None:

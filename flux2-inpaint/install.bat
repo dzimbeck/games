@@ -23,7 +23,7 @@ echo How much GPU VRAM does your graphics card have (in GB)?
 echo   Examples:  6, 8, 12, 16, 24, 48, 80
 echo   - 6 or 7 GB ........ FLUX.2 [klein] 4B  (4-bit quantized)
 echo   - 8 to 11 GB ....... FLUX.2 [klein] 4B  (CPU offload)
-echo   - 12 to 15 GB ...... FLUX.2 [klein] 4B  (full GPU)   ^<-- default
+echo   - 12 to 15 GB ...... FLUX.2 [klein] 4B  (CPU offload)   ^<-- default
 echo   - 16 to 23 GB ...... FLUX.2 [klein] 9B  (CPU offload)
 echo   - 24 to 47 GB ...... FLUX.2 [klein] 9B  (full GPU)
 echo   - 48 GB or more .... FLUX.2 [dev] 32B   (CPU offload)
@@ -66,9 +66,9 @@ if %VRAM% GEQ 48 (
 ) else if %VRAM% GEQ 12 (
     set "MODEL_NAME=black-forest-labs/FLUX.2-klein-4B"
     set "PIPELINE=klein"
-    set "RUN_MODE=cuda"
+    set "RUN_MODE=offload"
     set "STEPS=4"
-    set "MODEL_LABEL=FLUX.2 [klein] 4B (full GPU)"
+    set "MODEL_LABEL=FLUX.2 [klein] 4B (CPU offload)"
 ) else if %VRAM% GEQ 8 (
     set "MODEL_NAME=black-forest-labs/FLUX.2-klein-4B"
     set "PIPELINE=klein"

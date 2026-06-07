@@ -94,7 +94,7 @@ guidance:
 | --- | --- | --- | --- |
 | 6–7 GB | `black-forest-labs/FLUX.2-klein-4B` | 4-bit quantized | Apache-2.0 |
 | 8–11 GB | `black-forest-labs/FLUX.2-klein-4B` | CPU offload | Apache-2.0 |
-| **12–15 GB (default)** | `black-forest-labs/FLUX.2-klein-4B` | full GPU | Apache-2.0 |
+| **12–15 GB (default)** | `black-forest-labs/FLUX.2-klein-4B` | CPU offload | Apache-2.0 |
 | 16–23 GB | `black-forest-labs/FLUX.2-klein-9B` | CPU offload | Non-commercial |
 | 24–47 GB | `black-forest-labs/FLUX.2-klein-9B` | full GPU | Non-commercial |
 | 48 GB+ | `black-forest-labs/FLUX.2-dev` | CPU offload | Non-commercial |
