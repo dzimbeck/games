@@ -211,15 +211,16 @@ if not errorlevel 1 (
     if errorlevel 1 goto :deps_failed
 )
 
-:: The klein text encoder is Qwen3 (Qwen3ForCausalLM), which only exists in recent
-:: transformers. Importing that class -- not just "import transformers" -- makes a
-:: stale transformers get upgraded; otherwise generation fails at run time with
-:: "could not import Qwen3ForCausalLM".
-python -c "import accelerate, safetensors, huggingface_hub, PIL; from transformers import Qwen3ForCausalLM" >nul 2>&1
+:: The klein text encoder is Qwen3 (Qwen3ForCausalLM). It must be a transformers
+:: 4.x build: the class exists in 5.x too, but diffusers' FLUX.2 pipeline loads it
+:: through transformers' dynamic import, which breaks on the reorganised 5.x
+:: layout ("could not import Qwen3ForCausalLM"). So require Qwen3 importable AND
+:: major version 4; otherwise install/downgrade transformers into the 4.x range.
+python -c "import accelerate, safetensors, huggingface_hub, PIL; import transformers; from transformers import Qwen3ForCausalLM; assert transformers.__version__.split('.')[0] == '4'" >nul 2>&1
 if not errorlevel 1 (
     echo Core dependencies already installed; skipping.
 ) else (
-    set "PIP_ARGS=install -U transformers accelerate safetensors huggingface_hub Pillow"
+    set "PIP_ARGS=install -U transformers~=4.57 accelerate safetensors huggingface_hub Pillow"
     call :pip_retry
     if errorlevel 1 goto :deps_failed
 )

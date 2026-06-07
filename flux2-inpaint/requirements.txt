@@ -1,7 +1,10 @@
 # FLUX.2 dependencies for local image editing / inpainting.
 # FLUX.2 pipelines currently ship on diffusers main.
 git+https://github.com/huggingface/diffusers.git
-transformers>=4.57.0
+# Pin to the 4.x series: diffusers' FLUX.2 pipeline loads the klein text encoder
+# (Qwen3ForCausalLM) through transformers' dynamic import, which breaks on the
+# reorganised transformers 5.x layout ("could not import Qwen3ForCausalLM").
+transformers>=4.57.0,<5
 accelerate
 safetensors
 huggingface_hub>=0.26.0
