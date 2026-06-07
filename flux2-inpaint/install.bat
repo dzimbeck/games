@@ -218,6 +218,18 @@ if not errorlevel 1 (
     if errorlevel 1 goto :deps_failed
 )
 
+:: hf_xet lets huggingface_hub download Xet-backed repos (FLUX.2) via the
+:: native Xet protocol instead of the flaky HTTP bridge. Optional: if the wheel
+:: is unavailable for this platform we continue without it.
+python -c "import hf_xet" >nul 2>&1
+if not errorlevel 1 (
+    echo hf_xet already installed; skipping.
+) else (
+    echo Installing hf_xet for reliable Xet downloads...
+    set "PIP_ARGS=install hf_xet"
+    call :pip_retry
+)
+
 
 if "%RUN_MODE%"=="quant" (
     python -c "import bitsandbytes" >nul 2>&1

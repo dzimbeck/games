@@ -42,10 +42,30 @@ import time
 import urllib.request
 import zipfile
 
-# Patterns we intentionally do not download (single-file checkpoints used by
-# other runtimes such as ComfyUI / the reference CLI). We only need the
-# diffusers layout.
-IGNORE_PATTERNS = ["*.gguf", "flux2-*.safetensors", "flux-2-*.safetensors"]
+# Patterns we intentionally do not download. Two groups:
+#   1. Single-file checkpoints used by other runtimes (ComfyUI / reference CLI);
+#      we only need the diffusers layout.
+#   2. Repo media/sample assets (preview images, videos) that the diffusers
+#      pipeline never loads. These are often large, Xet-backed sample renders
+#      that needlessly cost bandwidth and can stall the install if their CDN
+#      host misbehaves; skipping them is safe for running the model.
+IGNORE_PATTERNS = [
+    "*.gguf",
+    "flux2-*.safetensors",
+    "flux-2-*.safetensors",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.webp",
+    "*.bmp",
+    "*.tif",
+    "*.tiff",
+    "*.mp4",
+    "*.mov",
+    "*.avi",
+    "*.webm",
+]
 
 # Pinned aria2 version used for the constructed fallback URLs (the GitHub API is
 # tried first so newer releases are picked up automatically).
@@ -383,10 +403,12 @@ def download_with_aria2(repo_id, target_dir, files, token):
         entries = [[rel_path, _add_download(rel_path)] for rel_path, _ in files]
 
         # Per-file retry budget for transient errors (e.g. DNS failures against
-        # the Xet CDN). Exceeding it for any single file fails the attempt; the
-        # outer retry loop in main() then resumes from the control files.
+        # the Xet bridge). Once a file exhausts it we stop and let the caller
+        # fall back to the official Hugging Face downloader, which speaks the
+        # Xet protocol directly instead of via the flaky HTTP bridge.
         file_retries = {}
-        max_file_retries = 12
+        max_file_retries = 4
+        warned = set()
 
         # Poll until everything is done (or unrecoverably errored).
         last_line_len = 0
@@ -497,14 +519,21 @@ def download_with_aria2(repo_id, target_dir, files, token):
                     return False
 
                 if requeued:
-                    last_line_len = 0
-                    sys.stdout.write("\n")
-                    shown = ", ".join(requeued[:3])
-                    more = " ..." if len(requeued) > 3 else ""
-                    print(
-                        f"  Transient error on {len(requeued)} file(s) "
-                        f"(e.g. DNS); resuming: {shown}{more}"
-                    )
+                    # Only announce files we have not already warned about, so a
+                    # persistently failing host does not spam an identical line
+                    # every poll. Exhausted files drop through to the fallback.
+                    fresh = [p for p in requeued if p not in warned]
+                    warned.update(requeued)
+                    if fresh:
+                        last_line_len = 0
+                        sys.stdout.write("\n")
+                        shown = ", ".join(fresh[:3])
+                        more = " ..." if len(fresh) > 3 else ""
+                        print(
+                            f"  Transient error on {len(fresh)} file(s) "
+                            f"(e.g. DNS to the Xet bridge); resuming: "
+                            f"{shown}{more}"
+                        )
 
             if n_done == len(entries):
                 sys.stdout.write("\n")
@@ -533,17 +562,55 @@ def download_with_aria2(repo_id, target_dir, files, token):
                 daemon.kill()
 
 
+def _file_complete(target_dir, rel_path, size):
+    """True when a single expected file is fully present (no .aria2 control)."""
+    full = os.path.join(target_dir, rel_path)
+    if not os.path.exists(full):
+        return False
+    if os.path.exists(full + ".aria2"):
+        return False
+    if size is not None and os.path.getsize(full) != size:
+        return False
+    return True
+
+
+def _missing_files(target_dir, files):
+    """Return the subset of ``files`` not yet fully downloaded."""
+    return [(p, s) for p, s in files if not _file_complete(target_dir, p, s)]
+
+
 def _all_present(target_dir, files):
     """True when every expected file exists with no leftover .aria2 control."""
-    for rel_path, size in files:
-        full = os.path.join(target_dir, rel_path)
-        if not os.path.exists(full):
-            return False
-        if os.path.exists(full + ".aria2"):
-            return False
-        if size is not None and os.path.getsize(full) != size:
-            return False
-    return True
+    return not _missing_files(target_dir, files)
+
+
+def download_with_hf(repo_id, target_dir, files, token):
+    """Fetch ``files`` with the official huggingface_hub downloader.
+
+    This is the authoritative path for Xet-backed repos (FLUX.2 lives on Hugging
+    Face's Xet storage). aria2 can only talk to the Xet HTTP *bridge*
+    (``cas-bridge.xethub.hf.co``), whose signed URLs expire and whose host has
+    proven DNS-flaky for some users. ``hf_hub_download`` instead uses Hugging
+    Face's token-aware client and, when ``hf_xet`` is installed, the native Xet
+    protocol, and it resumes partially fetched files. We use it to finish any
+    stragglers aria2 could not complete. Returns True if every file finished.
+    """
+    from huggingface_hub import hf_hub_download
+
+    ok = True
+    for rel_path, _size in files:
+        try:
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=rel_path,
+                local_dir=target_dir,
+                token=token,
+            )
+            print(f"  fetched {rel_path}")
+        except Exception as exc:  # noqa: BLE001 - report and keep going
+            print(f"  ERROR (huggingface_hub) {rel_path}: {exc}")
+            ok = False
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -614,20 +681,51 @@ def main():
 
     attempt = 0
     while attempt < MAX_DOWNLOAD_RETRIES:
+        todo = _missing_files(target_dir, files)
+        if not todo:
+            break
         attempt += 1
-        ok = download_with_aria2(repo_id, target_dir, files, token)
-        if ok and _all_present(target_dir, files):
+        done_n = len(files) - len(todo)
+        if done_n:
+            # Answers the obvious question: yes, we check what is already on
+            # disk and only fetch the rest, so finished files are never
+            # re-downloaded across retries.
+            print(f"  {done_n}/{len(files)} file(s) already present; "
+                  f"fetching {len(todo)} remaining.")
+        download_with_aria2(repo_id, target_dir, todo, token)
+
+        if not _missing_files(target_dir, files):
             break
         if attempt >= MAX_DOWNLOAD_RETRIES:
-            print()
-            print(f"ERROR: download did not complete after {attempt} attempts.")
-            print("It is resumable: re-run install.bat to continue where it "
-                  "left off.")
-            return 1
+            break
         wait = min(5 * attempt, 30)
         print(f"  Some files are still incomplete; retrying in {wait}s "
               f"(resuming)...")
         time.sleep(wait)
+
+    # Whatever aria2 could not finish (commonly Xet-bridge DNS/expiry issues),
+    # complete with the official, Xet-aware Hugging Face downloader.
+    todo = _missing_files(target_dir, files)
+    if todo:
+        print()
+        print(f"Finishing {len(todo)} file(s) with the official Hugging Face "
+              "downloader (handles Xet directly)...")
+        try:
+            download_with_hf(repo_id, target_dir, todo, token)
+        except Exception as exc:  # noqa: BLE001 - surface but fall through
+            print(f"  huggingface_hub downloader failed: {exc}")
+
+    todo = _missing_files(target_dir, files)
+    if todo:
+        print()
+        print(f"ERROR: {len(todo)} file(s) did not finish:")
+        for rel_path, _ in todo[:10]:
+            print(f"  - {rel_path}")
+        if len(todo) > 10:
+            print(f"  ... and {len(todo) - 10} more")
+        print("It is resumable: re-run install.bat to continue where it "
+              "left off.")
+        return 1
 
     # Record which repo this folder came from and mark it complete so future
     # runs can skip straight past the download step.
