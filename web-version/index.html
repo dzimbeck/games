@@ -996,11 +996,18 @@ class MapApp {
 
     if (W === 0 || H === 0) {
       // Layout not ready yet: try again on the next frame instead of drawing
-      // nothing (this was a cause of the grid silently never appearing).
-      console.warn('Canvas has zero size; deferring redraw.');
-      requestAnimationFrame(() => { this._resizeCanvas(); this.redraw(); });
+      // nothing (this was a cause of the grid silently never appearing). Cap
+      // the retries so we never spin forever if the stage stays collapsed.
+      this._zeroSizeRetries = (this._zeroSizeRetries || 0) + 1;
+      if (this._zeroSizeRetries <= 30) {
+        console.warn('Canvas has zero size; deferring redraw.', this._zeroSizeRetries);
+        requestAnimationFrame(() => { this._resizeCanvas(); this.redraw(); });
+      } else {
+        console.error('Canvas still has zero size after retries; giving up.');
+      }
       return;
     }
+    this._zeroSizeRetries = 0;
 
     const c0 = Math.max(0, Math.floor((-this.panX) / dw));
     const r0 = Math.max(0, Math.floor((-this.panY) / dh));
@@ -1024,7 +1031,8 @@ class MapApp {
 
     // Grid lines. Always draw something: at fine zoom draw every cell border;
     // once cells get small, thin the lines out (every Nth) so a grid is still
-    // visible instead of vanishing entirely.
+    // visible instead of vanishing entirely. step==1 while cells are >=6px wide;
+    // below that we draw a line roughly every 8px of screen space.
     const step = dw >= 6 ? 1 : Math.ceil(8 / dw);
     ctx.strokeStyle = step === 1 ? GRID_COLOR : GRID_COLOR_MAJOR;
     ctx.lineWidth = 1;
