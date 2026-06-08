@@ -322,6 +322,21 @@ function newCanvas(w, h) {
   return c;
 }
 
+/* Rebuild a canvas of the given size from a PNG/JPEG data URL. Used when a
+   stored history entry needs to become the active (rendered) tile again. */
+function dataUrlToCanvas(dataUrl, w, h) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const cv = newCanvas(w, h);
+      cv.getContext('2d').drawImage(img, 0, 0, w, h);
+      resolve(cv);
+    };
+    img.onerror = () => resolve(null);
+    img.src = dataUrl;
+  });
+}
+
 /* ------------------------------------------------------------------- model */
 class MapModel {
   constructor(cols, rows, cellW, cellH) {
@@ -330,19 +345,84 @@ class MapModel {
     this.cellW = roundTo(cellW);
     this.cellH = roundTo(cellH);
     this.tiles = new Map(); 
-    this.ids = new Map();   // "c,r" -> generationId that produced this tile
+    this.ids = new Map();   // "c,r" -> generationId that produced the active tile
+    /* "c,r" -> array of generation results, newest/active first. Each entry is
+       { id, prompt, savedAt, dataUrl, canvas? }. history[0] is the rendered
+       tile; the user can browse/switch/delete entries from the right-click
+       menu, which keeps this array and the tiles/ids caches in sync. */
+    this.history = new Map();
   }
   key(c, r) { return c + ',' + r; }
   inBounds(c, r) { return c >= 0 && c < this.cols && r >= 0 && r < this.rows; }
   isEmpty(c, r) { return !this.tiles.has(this.key(c, r)); }
   getTile(c, r) { return this.tiles.get(this.key(c, r)) || null; }
   getId(c, r) { return this.ids.get(this.key(c, r)) || null; }
+  getHistory(c, r) { return this.history.get(this.key(c, r)) || []; }
   setTile(c, r, canvas, generationId = null) {
     if (!this.inBounds(c, r)) return;
     this.tiles.set(this.key(c, r), canvas);
     if (generationId) this.ids.set(this.key(c, r), generationId);
   }
-  clearTile(c, r) { this.tiles.delete(this.key(c, r)); this.ids.delete(this.key(c, r)); }
+  clearTile(c, r) {
+    const k = this.key(c, r);
+    this.tiles.delete(k);
+    this.ids.delete(k);
+    this.history.delete(k);
+  }
+
+  /* Record a freshly generated result for a cell. The new result becomes the
+     active (first) entry; previous results are kept so they can be restored. */
+  recordResult(c, r, canvas, meta = {}) {
+    if (!this.inBounds(c, r)) return;
+    const k = this.key(c, r);
+    const entry = {
+      id: meta.id || null,
+      prompt: meta.prompt || '',
+      savedAt: new Date().toISOString(),
+      dataUrl: canvas.toDataURL('image/png'),
+      canvas,
+    };
+    const hist = this.history.get(k) || [];
+    hist.unshift(entry);
+    this.history.set(k, hist);
+    this.tiles.set(k, canvas);
+    if (entry.id) this.ids.set(k, entry.id); else this.ids.delete(k);
+  }
+
+  /* Make the entry at idx the active one (moves it to the front) and refresh
+     the rendered tile from its stored image. */
+  async setActiveIndex(c, r, idx) {
+    const k = this.key(c, r);
+    const hist = this.history.get(k) || [];
+    if (idx <= 0 || idx >= hist.length) return;
+    const [entry] = hist.splice(idx, 1);
+    hist.unshift(entry);
+    this.history.set(k, hist);
+    await this.refreshActive(c, r);
+  }
+
+  /* Remove the entry at idx. Returns the number of remaining entries. */
+  removeHistoryIndex(c, r, idx) {
+    const k = this.key(c, r);
+    const hist = this.history.get(k) || [];
+    if (idx < 0 || idx >= hist.length) return hist.length;
+    hist.splice(idx, 1);
+    if (!hist.length) { this.clearTile(c, r); return 0; }
+    this.history.set(k, hist);
+    return hist.length;
+  }
+
+  /* Sync the tiles/ids caches to the current active (first) history entry,
+     rebuilding its canvas from the stored data URL if needed. */
+  async refreshActive(c, r) {
+    const k = this.key(c, r);
+    const hist = this.history.get(k) || [];
+    if (!hist.length) { this.clearTile(c, r); return; }
+    const e = hist[0];
+    if (!e.canvas) e.canvas = await dataUrlToCanvas(e.dataUrl, this.cellW, this.cellH);
+    if (e.canvas) this.tiles.set(k, e.canvas);
+    if (e.id) this.ids.set(k, e.id); else this.ids.delete(k);
+  }
 
   static regionBounds(cells) {
     let c0 = Infinity, r0 = Infinity, c1 = -Infinity, r1 = -Infinity;
@@ -372,9 +452,12 @@ class MapModel {
     return { sc0, sr0, side, tier, px: tier * TILE_PX };
   }
 
-  /* Build the square sent to the model: existing tiles as context, selected
-     cells painted GREEN (fill these), every other empty cell BLACK. */
-  buildSquareContext(square, selectedSet) {
+  /* Build the square sent to the model: existing tiles as context, the fill
+     (green) cells painted GREEN to be filled, every other empty cell BLACK.
+     `fillSet` holds the cells we actually want regenerated; any selected cell
+     that already has art is intentionally NOT in fillSet so it is drawn as
+     locked image context and left untouched. */
+  buildSquareContext(square, fillSet) {
     const { sc0, sr0, side } = square;
     const w = side * this.cellW, h = side * this.cellH;
     const canvas = newCanvas(w, h);
@@ -386,7 +469,7 @@ class MapModel {
         const c = sc0 + dc, r = sr0 + dr;
         const x = dc * this.cellW, y = dr * this.cellH;
         const tile = this.getTile(c, r);
-        if (tile && !selectedSet.has(c + ',' + r)) {
+        if (tile && !fillSet.has(c + ',' + r)) {
           ctx.drawImage(tile, x, y);
         }
       }
@@ -395,7 +478,7 @@ class MapModel {
     for (let dr = 0; dr < side; dr++) {
       for (let dc = 0; dc < side; dc++) {
         const c = sc0 + dc, r = sr0 + dr;
-        if (selectedSet.has(c + ',' + r)) {
+        if (fillSet.has(c + ',' + r)) {
           ctx.fillRect(dc * this.cellW, dr * this.cellH, this.cellW, this.cellH);
         }
       }
@@ -403,25 +486,26 @@ class MapModel {
     return canvas;
   }
 
-  regionHasContext(square, selectedSet) {
+  regionHasContext(square, fillSet) {
     const { sc0, sr0, side } = square;
     for (let dr = 0; dr < side; dr++) {
       for (let dc = 0; dc < side; dc++) {
         const c = sc0 + dc, r = sr0 + dr;
-        if (!this.isEmpty(c, r) && !selectedSet.has(c + ',' + r)) return true;
+        if (!this.isEmpty(c, r) && !fillSet.has(c + ',' + r)) return true;
       }
     }
     return false;
   }
 
-  /* Crop each selected cell out of the square result and store it. The result
-     image is square.px on a side and represents square.side cells, so one cell
-     occupies (px / side) px in the result. */
-  applySquareResult(image, square, selected, generationId) {
+  /* Crop each fill (green) cell out of the square result and store it. The
+     result image is square.px on a side and represents square.side cells, so
+     one cell occupies (px / side) px in the result. Only the green cells are
+     written back, so locked context tiles in the square are never altered. */
+  applySquareResult(image, square, fillCells, generationId, prompt) {
     const { sc0, sr0, side, px } = square;
     const cellPx = px / side;
     const changed = [];
-    for (const [c, r] of selected) {
+    for (const [c, r] of fillCells) {
       if (!this.inBounds(c, r)) continue;
       const dc = c - sc0, dr = r - sr0;
       if (dc < 0 || dr < 0 || dc >= side || dr >= side) continue;
@@ -431,7 +515,7 @@ class MapModel {
         dc * cellPx, dr * cellPx, cellPx, cellPx,
         0, 0, this.cellW, this.cellH,
       );
-      this.setTile(c, r, tile, generationId);
+      this.recordResult(c, r, tile, { id: generationId, prompt });
       changed.push([c, r]);
     }
     return changed;
@@ -457,18 +541,33 @@ class MapModel {
     const tiles = [];
     for (const [k, tile] of this.tiles) {
       const [c, r] = k.split(',').map(Number);
-      tiles.push({ c, r, data: tile.toDataURL('image/png'), id: this.ids.get(k) || null });
+      const hist = this.history.get(k) || [];
+      tiles.push({
+        c, r,
+        data: tile.toDataURL('image/png'),
+        id: this.ids.get(k) || null,
+        history: hist.map(e => ({ id: e.id, prompt: e.prompt, savedAt: e.savedAt, data: e.dataUrl })),
+      });
     }
     return { cols: this.cols, rows: this.rows, cellW: this.cellW, cellH: this.cellH, tiles };
   }
   static async fromJSON(meta) {
     const model = new MapModel(meta.cols, meta.rows, meta.cellW, meta.cellH);
     await Promise.all((meta.tiles || []).map(t => new Promise((resolve) => {
+      if (!model.inBounds(t.c, t.r)) { resolve(); return; }
       const img = new Image();
       img.onload = () => {
         const tile = newCanvas(model.cellW, model.cellH);
         tile.getContext('2d').drawImage(img, 0, 0, model.cellW, model.cellH);
         model.setTile(t.c, t.r, tile, t.id || null);
+        const histMeta = (t.history && t.history.length)
+          ? t.history
+          : [{ id: t.id || null, prompt: '', savedAt: null, data: t.data }];
+        const entries = histMeta.map((e, i) => ({
+          id: e.id || null, prompt: e.prompt || '', savedAt: e.savedAt || null,
+          dataUrl: e.data, canvas: i === 0 ? tile : null,
+        }));
+        model.history.set(model.key(t.c, t.r), entries);
         resolve();
       };
       img.onerror = () => resolve();
@@ -528,12 +627,18 @@ class LeonardoGenerator {
 
   async generateRegion(model, selected, prompt, refImages) {
     const bounds = MapModel.regionBounds(selected);
-    const selectedSet = new Set(selected.map(([c, r]) => c + ',' + r));
     const square = model.squareTier(bounds);
     if (!square) {
       throw new Error(`Selection exceeds the ${MAX_TIER}x${MAX_TIER} tile limit.`);
     }
-    const hasContext = model.regionHasContext(square, selectedSet);
+    /* Fill (green) targets = selected cells that are currently empty, so we
+       outpaint into blank space and never repaint a neighbour's existing art.
+       If every selected cell already has art, treat them all as targets (an
+       explicit full regeneration / inpaint of those tiles). */
+    const emptySelected = selected.filter(([c, r]) => model.isEmpty(c, r));
+    const fillCells = emptySelected.length ? emptySelected : selected;
+    const fillSet = new Set(fillCells.map(([c, r]) => c + ',' + r));
+    const hasContext = model.regionHasContext(square, fillSet);
     const { px } = square;
 
     console.log('Generation plan:', {
@@ -542,6 +647,7 @@ class LeonardoGenerator {
       requestSize: `${px}x${px}`,
       hasContext,
       selectedCells: selected,
+      fillCells,
     });
 
     let text = prompt;
@@ -552,7 +658,7 @@ class LeonardoGenerator {
     text += '\n\nThis is an image edit on a square canvas. Fill ONLY the solid ' +
       'green cells, painting a single seamless image that blends with the ' +
       'surrounding non-green tiles. Do not change any non-green pixels.';
-    const contextCanvas = model.buildSquareContext(square, selectedSet);
+    const contextCanvas = model.buildSquareContext(square, fillSet);
     const contextDataUrl = contextCanvas.toDataURL('image/png');
     console.log('Context square (data URL length):', contextDataUrl.length);
     const ctxId = await this.uploadImage(dataUrlToBlob(contextDataUrl));
@@ -602,7 +708,7 @@ class LeonardoGenerator {
     // Normalize the result to the exact square size, then crop per cell.
     const sized = newCanvas(px, px);
     sized.getContext('2d').drawImage(resultImg, 0, 0, px, px);
-    const changed = model.applySquareResult(sized, square, selected, generationId);
+    const changed = model.applySquareResult(sized, square, fillCells, generationId, text);
     console.log('Applied result, updated cells:', changed, 'generationId:', generationId);
     return { changed, generationId };
   }
@@ -734,7 +840,13 @@ class MapApp {
     this.stage.addEventListener('mousedown', (e) => this.onPress(e));
     window.addEventListener('mousemove', (e) => this.onMove(e));
     window.addEventListener('mouseup', (e) => this.onRelease(e));
-    this.stage.addEventListener('contextmenu', (e) => e.preventDefault());
+    this.stage.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      // A right-drag is a pan, not a menu request: swallow it once.
+      if (this._rightDragMoved) { this._rightDragMoved = false; return; }
+      const cell = this.eventToCell(e);
+      if (cell) this.showCellContextMenu(cell);
+    });
     this.stage.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
   }
 
@@ -790,6 +902,7 @@ class MapApp {
     if (e.button === 1 || e.button === 2) {
       this.panning = true;
       this.panLast = [e.clientX, e.clientY];
+      if (e.button === 2) { this._rightDownPos = [e.clientX, e.clientY]; this._rightDragMoved = false; }
       return;
     }
     if (e.button !== 0) return;
@@ -803,6 +916,10 @@ class MapApp {
       this.panX += e.clientX - lx;
       this.panY += e.clientY - ly;
       this.panLast = [e.clientX, e.clientY];
+      if (this._rightDownPos) {
+        const dx = e.clientX - this._rightDownPos[0], dy = e.clientY - this._rightDownPos[1];
+        if (dx * dx + dy * dy > 36) this._rightDragMoved = true;
+      }
       this.redraw();
       return;
     }
@@ -815,7 +932,7 @@ class MapApp {
   }
 
   onRelease(e) {
-    if (this.panning) { this.panning = false; this.panLast = null; return; }
+    if (this.panning) { this.panning = false; this.panLast = null; this._rightDownPos = null; return; }
     if (this.dragStart === null) return;
     if (this.dragging && this.previewRect) {
       const [[c0, r0], [c1, r1]] = this.previewRect;
@@ -893,6 +1010,111 @@ class MapApp {
     });
   }
 
+  /* Right-click on a tile: offer to browse its generation history or undo the
+     most recent generation. */
+  async showCellContextMenu([c, r]) {
+    if (this.busy) return;
+    const hist = this.model.getHistory(c, r);
+    if (!hist.length) {
+      Swal.fire({ icon: 'info', title: `Tile ${c},${r}`,
+        text: 'No generation history for this tile yet.' });
+      return;
+    }
+    const res = await Swal.fire({
+      title: `Tile ${c},${r}`,
+      text: `${hist.length} generation(s) saved. The first is the active one.`,
+      showCancelButton: true,
+      showDenyButton: true,
+      confirmButtonText: 'Show history',
+      denyButtonText: 'Undo last generation',
+      cancelButtonText: 'Close',
+    });
+    if (res.isConfirmed) await this.showHistory([c, r]);
+    else if (res.isDenied) await this.undoLast([c, r]);
+  }
+
+  /* Remove the active (most recent) result for a cell, reverting to the
+     previous one (or clearing the tile if it was the only result). */
+  async undoLast([c, r]) {
+    const remaining = this.model.removeHistoryIndex(c, r, 0);
+    if (remaining > 0) await this.model.refreshActive(c, r);
+    await this.persistCellHistory(c, r);
+    this.redraw();
+    this.setStatus(remaining > 0
+      ? `Reverted tile ${c},${r} to the previous generation.`
+      : `Removed the only generation for tile ${c},${r}.`);
+  }
+
+  /* Interactive history browser: step through a cell's saved results, switch
+     which one is active, or delete individual results. */
+  async showHistory([c, r]) {
+    const model = this.model;
+    const self = this;
+    let idx = 0;
+    const fmt = (e) => {
+      const id = e.id ? `id ${String(e.id).slice(0, 8)}` : '(no id)';
+      const when = e.savedAt ? ` \u00b7 ${new Date(e.savedAt).toLocaleString()}` : '';
+      return id + when;
+    };
+    await Swal.fire({
+      title: `Tile ${c},${r} history`,
+      width: 540,
+      showConfirmButton: false,
+      showCloseButton: true,
+      html: `
+        <div style="display:flex;flex-direction:column;gap:8px;align-items:center">
+          <img id="h-img" alt="result preview"
+            style="width:256px;height:256px;object-fit:cover;border:1px solid #444;border-radius:4px;background:#000" />
+          <div id="h-meta" style="font-size:12px;color:#666"></div>
+          <div id="h-prompt"
+            style="font-size:12px;color:#444;max-height:60px;overflow:auto;text-align:left;width:100%;white-space:pre-wrap"></div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:center">
+            <button id="h-prev" class="swal2-styled" style="background:#555">&larr; Prev</button>
+            <button id="h-next" class="swal2-styled" style="background:#555">Next &rarr;</button>
+            <button id="h-use" class="swal2-styled" style="background:#39c0ff;color:#000">Use this</button>
+            <button id="h-del" class="swal2-styled" style="background:#c0392b">Delete this</button>
+          </div>
+        </div>`,
+      didOpen: () => {
+        const imgEl = document.getElementById('h-img');
+        const metaEl = document.getElementById('h-meta');
+        const promptEl = document.getElementById('h-prompt');
+        const useBtn = document.getElementById('h-use');
+        const render = () => {
+          const hist = model.getHistory(c, r);
+          if (!hist.length) { Swal.close(); return; }
+          if (idx >= hist.length) idx = hist.length - 1;
+          if (idx < 0) idx = 0;
+          const e = hist[idx];
+          imgEl.src = e.dataUrl;
+          metaEl.textContent = `${idx + 1} / ${hist.length}${idx === 0 ? ' (active)' : ''} \u2014 ${fmt(e)}`;
+          promptEl.textContent = e.prompt || '';
+          useBtn.disabled = idx === 0;
+        };
+        document.getElementById('h-prev').onclick = () => { idx = Math.max(0, idx - 1); render(); };
+        document.getElementById('h-next').onclick = () => {
+          idx = Math.min(model.getHistory(c, r).length - 1, idx + 1); render();
+        };
+        useBtn.onclick = async () => {
+          await model.setActiveIndex(c, r, idx);
+          await self.persistCellHistory(c, r);
+          idx = 0;
+          self.redraw();
+          render();
+          self.setStatus(`Switched tile ${c},${r} to a different saved generation.`);
+        };
+        document.getElementById('h-del').onclick = async () => {
+          const remaining = model.removeHistoryIndex(c, r, idx);
+          if (remaining > 0) await model.refreshActive(c, r);
+          await self.persistCellHistory(c, r);
+          self.redraw();
+          if (!remaining) { Swal.close(); } else { idx = 0; render(); }
+        };
+        render();
+      },
+    });
+  }
+
   async onGenerate() {
     if (this.busy) return;
     const selected = this.selectedCells();
@@ -926,7 +1148,7 @@ class MapApp {
       }
       const { changed, generationId } =
         await this.generator.generateRegion(this.model, selected, prompt, this.refs);
-      await this.persistCells(changed, generationId);
+      await this.persistCells(changed);
       Swal.close();
       this.redraw();
       this.setStatus(`Done. Updated ${changed.length} tile(s). generationId ${generationId}.`);
@@ -940,23 +1162,34 @@ class MapApp {
     }
   }
 
-  /* Save each freshly produced cell's image (IndexedDB) and its x,y -> id map
-     (localStorage) so a reload re-renders it without re-downloading. */
-  async persistCells(cells, generationId) {
+  /* Save each freshly produced cell's full history (IndexedDB) and its
+     x,y -> active id map (localStorage) so a reload re-renders it without
+     re-downloading. */
+  async persistCells(cells) {
+    for (const [c, r] of cells) await this.persistCellHistory(c, r);
+    console.log('Persisted cells to IndexedDB + tile index:', cells);
+  }
+
+  /* Write (or remove) a single cell's generation history to the caches. */
+  async persistCellHistory(c, r) {
+    const k = c + ',' + r;
+    const hist = this.model.getHistory(c, r);
     const index = loadTileIndex();
-    for (const [c, r] of cells) {
-      const k = c + ',' + r;
-      const tile = this.model.getTile(c, r);
-      if (!tile) continue;
+    if (!hist.length) {
+      delete index[k];
+      try { await ImageDB.delete(k); } catch (err) { console.warn('Could not delete cached tile', k, err); }
+    } else {
       try {
-        await ImageDB.put(k, { dataUrl: tile.toDataURL('image/png'), id: generationId, c, r });
-        index[k] = { c, r, id: generationId };
+        await ImageDB.put(k, {
+          history: hist.map(e => ({ id: e.id, prompt: e.prompt, savedAt: e.savedAt, dataUrl: e.dataUrl })),
+          c, r,
+        });
+        index[k] = { c, r, id: hist[0].id || null };
       } catch (err) {
         console.warn('Could not cache tile', k, err);
       }
     }
     saveTileIndex(index);
-    console.log('Persisted cells to IndexedDB + tile index:', cells, 'id:', generationId);
   }
 
   exportPNG() {
@@ -1234,18 +1467,29 @@ async function restorePersistedTiles(model) {
     if (!model.inBounds(c, r)) return;
     try {
       const rec = await ImageDB.get(c + ',' + r);
-      if (!rec || !rec.dataUrl) return;
+      if (!rec) return;
+      // New format stores a history array; old format stored a single dataUrl.
+      const histMeta = (rec.history && rec.history.length)
+        ? rec.history
+        : (rec.dataUrl ? [{ id: rec.id || id || null, prompt: '', savedAt: null, dataUrl: rec.dataUrl }] : null);
+      if (!histMeta) return;
+      const active = histMeta[0];
       await new Promise((resolve) => {
         const img = new Image();
         img.onload = () => {
           const tile = newCanvas(model.cellW, model.cellH);
           tile.getContext('2d').drawImage(img, 0, 0, model.cellW, model.cellH);
-          model.setTile(c, r, tile, id || rec.id || null);
+          model.setTile(c, r, tile, active.id || id || null);
+          const list = histMeta.map((e, i) => ({
+            id: e.id || null, prompt: e.prompt || '', savedAt: e.savedAt || null,
+            dataUrl: e.dataUrl, canvas: i === 0 ? tile : null,
+          }));
+          model.history.set(model.key(c, r), list);
           restored++;
           resolve();
         };
         img.onerror = () => resolve();
-        img.src = rec.dataUrl;
+        img.src = active.dataUrl;
       });
     } catch (err) {
       console.warn('Could not restore tile', c, r, err);
