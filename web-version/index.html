@@ -505,10 +505,23 @@ class LeonardoGenerator {
     const fields = typeof out.fields === 'string' ? JSON.parse(out.fields) : out.fields;
     const form = new FormData();
     for (const [k, v] of Object.entries(fields)) form.append(k, v);
-    form.append('file', blob, `region.${extension}`); 
-    const s3Resp = await fetch(out.url, { method: 'POST', body: form });
-    if (!s3Resp.ok && s3Resp.status !== 204) {
-      throw new Error(`Image upload to storage failed (HTTP ${s3Resp.status}).`);
+    form.append('file', blob, `region.${extension}`);
+    // The presigned S3 (s3-accelerate) bucket does not return an
+    // Access-Control-Allow-Origin header, so a normal cross-origin fetch is
+    // blocked from *reading* the response even though the upload itself
+    // succeeds (S3 replies 204). We don't need the response body or status:
+    // the image id was already returned by /init-image above. Use no-cors so
+    // the browser sends the POST and resolves with an opaque response instead
+    // of throwing a CORS error.
+    try {
+      const s3Resp = await fetch(out.url, { method: 'POST', body: form, mode: 'no-cors' });
+      // Opaque responses report type 'opaque' and status 0; a same-origin or
+      // CORS-enabled response still lets us catch a genuine non-2xx failure.
+      if (s3Resp.type !== 'opaque' && !s3Resp.ok && s3Resp.status !== 204) {
+        throw new Error(`Image upload to storage failed (HTTP ${s3Resp.status}).`);
+      }
+    } catch (err) {
+      throw new Error(`Image upload to storage failed: ${err.message}`);
     }
     return out.id; 
   }
