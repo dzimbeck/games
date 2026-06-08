@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Windows batch scripts must use CRLF line endings, otherwise cmd.exe
+# misparses parenthesized blocks and fails with errors such as
+# "... was unexpected at this time".
+*.bat text eol=crlf
+*.cmd text eol=crlf

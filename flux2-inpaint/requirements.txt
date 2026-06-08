@@ -1,0 +1,21 @@
+# FLUX.2 dependencies for local image editing / inpainting.
+# FLUX.2 pipelines currently ship on diffusers main.
+git+https://github.com/huggingface/diffusers.git
+# Pin to the 4.x series: diffusers' FLUX.2 pipeline loads the klein text encoder
+# (Qwen3ForCausalLM) through transformers' dynamic import, which breaks on the
+# reorganised transformers 5.x layout ("could not import Qwen3ForCausalLM").
+transformers>=4.57.0,<5
+accelerate
+safetensors
+huggingface_hub>=0.26.0
+# download_model.py runs the aria2 (aria2c) binary directly on a generated batch
+# input file for resumable, progress-visible model downloads. The aria2 binary
+# itself is fetched automatically (or use a system 'aria2c' on PATH); no Python
+# aria2 bindings are required.
+Pillow
+# The grid map painter GUI (map_gui.py) also needs Tkinter, which ships with the
+# standard CPython installers (and the pyenv-win build used by install.bat).
+# Install torch/torchvision separately with the right CUDA build, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Optional, only needed for the 4-bit "quant" mode on small GPUs:
+#   pip install bitsandbytes
