@@ -140,43 +140,70 @@ const INITIAL_CELL_PX = 100;
 
 const STORAGE_KEY_CONFIG = 'mapgen.apiConfig';
 const STORAGE_KEY_GENERATIONS = 'mapgen.generations';
-const GRID_COLOR = '#3a4250';      
+const STORAGE_KEY_TILE_INDEX = 'mapgen.tileIndex';
+const IDB_NAME = 'mapgen';
+const IDB_STORE = 'tiles';
+const GRID_COLOR = '#5a6678';      
+const GRID_COLOR_MAJOR = '#8893a8';
+const EMPTY_CELL = '#000000';
+const EMPTY_CELL_ALT = '#0b0d12';   // checker so the grid reads even on empty maps
 const SELECT_OUTLINE = '#39c0ff';
 const SELECT_FILL = 'rgba(57,192,255,0.30)';
 const GREEN = [0, 255, 0];         
+
+/* Nano Banana 2 only emits square images whose side is a multiple of 1024.
+   1x1 -> 1024, 2x2 -> 2048, up to 4x4 -> 4096. A selection's bounding box may
+   therefore never exceed 4 cells on either side. */
+const TIER_SIZES = [1, 2, 4];
+const MAX_TIER = 4;
+const TILE_PX = 1024;
 
 const LEO_V2_GENERATIONS = 'https://cloud.leonardo.ai/api/rest/v2/generations';
 const LEO_V1 = 'https://cloud.leonardo.ai/api/rest/v1';
 
 const DEFAULT_MODEL = 'nano-banana-2';
 
-const ASPECT_PAIRS = {
-  '1:1': [1024, 1024],
-  '2:3': [848, 1264],
-  '3:2': [1264, 848],
-  '3:4': [896, 1200],
-  '4:3': [1200, 896],
-  '4:5': [928, 1152],
-  '5:4': [1152, 928],
-  '9:16': [768, 1376],
-  '16:9': [1376, 768],
-  '21:9': [1584, 672],
-};
-
 /* --------------------------------------------------------------- utilities */
 function roundTo(value, multiple = 16) {
   return Math.max(multiple, Math.round(value / multiple) * multiple);
 }
 
-function closestPair(w, h) {
-  const target = w / h;
-  let best = ASPECT_PAIRS['1:1'];
-  let bestDiff = Infinity;
-  for (const pair of Object.values(ASPECT_PAIRS)) {
-    const diff = Math.abs(pair[0] / pair[1] - target);
-    if (diff < bestDiff) { bestDiff = diff; best = pair; }
+/* Is the selected set 4-connected (orthogonally contiguous)? */
+function isContiguous(cells) {
+  if (cells.length <= 1) return true;
+  const set = new Set(cells.map(([c, r]) => c + ',' + r));
+  const seen = new Set();
+  const [sc, sr] = cells[0];
+  const stack = [[sc, sr]];
+  seen.add(sc + ',' + sr);
+  while (stack.length) {
+    const [c, r] = stack.pop();
+    for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const k = (c + dc) + ',' + (r + dr);
+      if (set.has(k) && !seen.has(k)) { seen.add(k); stack.push([c + dc, r + dr]); }
+    }
   }
-  return best;
+  return seen.size === set.size;
+}
+
+/* Validate a selection against the Nano-Banana tier rules. Returns
+   { ok, reason, bounds, span } so callers can notify the user. */
+function validateSelection(cells) {
+  if (!cells.length) return { ok: false, reason: 'Select one or more tiles first.' };
+  const bounds = MapModel.regionBounds(cells);
+  const span = Math.max(bounds[2] - bounds[0] + 1, bounds[3] - bounds[1] + 1);
+  if (span > MAX_TIER) {
+    return { ok: false, bounds, span,
+      reason: `Selection spans ${span} tiles on a side. Nano Banana 2 only renders ` +
+              `up to ${MAX_TIER}x${MAX_TIER} (${MAX_TIER * TILE_PX}px) at once. ` +
+              `Please select a smaller, connected area.` };
+  }
+  if (!isContiguous(cells)) {
+    return { ok: false, bounds, span,
+      reason: 'Selected tiles must be connected (touching edge to edge). ' +
+              'Please select a single contiguous block.' };
+  }
+  return { ok: true, bounds, span };
 }
 
 function dataUrlToBlob(dataUrl) {
@@ -215,10 +242,78 @@ function recordGeneration(record) {
     const list = raw ? JSON.parse(raw) : [];
     list.push({ ...record, savedAt: new Date().toISOString() });
     localStorage.setItem(STORAGE_KEY_GENERATIONS, JSON.stringify(list.slice(-100)));
+    console.log('Saved generation response to localStorage:', record);
   } catch (err) {
     console.warn('Could not persist generation response:', err);
   }
 }
+
+/* The x,y -> generationId index lives in localStorage so it survives reloads
+   and is cheap to scan; the heavy image bytes live in IndexedDB keyed by the
+   same "c,r" so we never re-download a tile we already have. */
+function loadTileIndex() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_TILE_INDEX);
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    console.warn('Could not read tile index:', err);
+    return {};
+  }
+}
+
+function saveTileIndex(index) {
+  try {
+    localStorage.setItem(STORAGE_KEY_TILE_INDEX, JSON.stringify(index));
+  } catch (err) {
+    console.warn('Could not persist tile index:', err);
+  }
+}
+
+/* ---------------------------------------------------- IndexedDB image cache */
+const ImageDB = {
+  _db: null,
+  async open() {
+    if (this._db) return this._db;
+    this._db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return this._db;
+  },
+  async _tx(mode) {
+    const db = await this.open();
+    return db.transaction(IDB_STORE, mode).objectStore(IDB_STORE);
+  },
+  async put(key, value) {
+    const store = await this._tx('readwrite');
+    return new Promise((resolve, reject) => {
+      const req = store.put(value, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async get(key) {
+    const store = await this._tx('readonly');
+    return new Promise((resolve, reject) => {
+      const req = store.get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async delete(key) {
+    const store = await this._tx('readwrite');
+    return new Promise((resolve, reject) => {
+      const req = store.delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+};
 
 function newCanvas(w, h) {
   const c = document.createElement('canvas');
@@ -235,16 +330,19 @@ class MapModel {
     this.cellW = roundTo(cellW);
     this.cellH = roundTo(cellH);
     this.tiles = new Map(); 
+    this.ids = new Map();   // "c,r" -> generationId that produced this tile
   }
   key(c, r) { return c + ',' + r; }
   inBounds(c, r) { return c >= 0 && c < this.cols && r >= 0 && r < this.rows; }
   isEmpty(c, r) { return !this.tiles.has(this.key(c, r)); }
   getTile(c, r) { return this.tiles.get(this.key(c, r)) || null; }
-  setTile(c, r, canvas) {
+  getId(c, r) { return this.ids.get(this.key(c, r)) || null; }
+  setTile(c, r, canvas, generationId = null) {
     if (!this.inBounds(c, r)) return;
     this.tiles.set(this.key(c, r), canvas);
+    if (generationId) this.ids.set(this.key(c, r), generationId);
   }
-  clearTile(c, r) { this.tiles.delete(this.key(c, r)); }
+  clearTile(c, r) { this.tiles.delete(this.key(c, r)); this.ids.delete(this.key(c, r)); }
 
   static regionBounds(cells) {
     let c0 = Infinity, r0 = Infinity, c1 = -Infinity, r1 = -Infinity;
@@ -258,56 +356,82 @@ class MapModel {
     return [(c1 - c0 + 1) * this.cellW, (r1 - r0 + 1) * this.cellH];
   }
 
-  buildRegionImage(bounds, greenSelected = null) {
+  /* Given a selection bounding box, return the square (in cells) of the
+     smallest Nano-Banana tier (1/2/4) that fully contains it, anchored so it
+     stays inside the map. side = tier cells, px = tier * 1024. */
+  squareTier(bounds) {
     const [c0, r0, c1, r1] = bounds;
-    const [w, h] = this.regionPixelSize(bounds);
+    const need = Math.max(c1 - c0 + 1, r1 - r0 + 1);
+    const tier = TIER_SIZES.find(t => t >= need);
+    if (!tier) return null; // bigger than 4x4 -> caller must reject
+    const side = tier;
+    let sc0 = Math.min(c0, Math.max(0, this.cols - side));
+    let sr0 = Math.min(r0, Math.max(0, this.rows - side));
+    sc0 = Math.max(0, sc0);
+    sr0 = Math.max(0, sr0);
+    return { sc0, sr0, side, tier, px: tier * TILE_PX };
+  }
+
+  /* Build the square sent to the model: existing tiles as context, selected
+     cells painted GREEN (fill these), every other empty cell BLACK. */
+  buildSquareContext(square, selectedSet) {
+    const { sc0, sr0, side } = square;
+    const w = side * this.cellW, h = side * this.cellH;
     const canvas = newCanvas(w, h);
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, w, h);
-    if (greenSelected) {
-      ctx.fillStyle = `rgb(${GREEN[0]},${GREEN[1]},${GREEN[2]})`;
-      for (const [c, r] of greenSelected) {
-        if (c >= c0 && c <= c1 && r >= r0 && r <= r1 && this.isEmpty(c, r)) {
-          ctx.fillRect((c - c0) * this.cellW, (r - r0) * this.cellH, this.cellW, this.cellH);
+    for (let dr = 0; dr < side; dr++) {
+      for (let dc = 0; dc < side; dc++) {
+        const c = sc0 + dc, r = sr0 + dr;
+        const x = dc * this.cellW, y = dr * this.cellH;
+        const tile = this.getTile(c, r);
+        if (tile && !selectedSet.has(c + ',' + r)) {
+          ctx.drawImage(tile, x, y);
         }
       }
     }
-    for (let r = r0; r <= r1; r++) {
-      for (let c = c0; c <= c1; c++) {
-        const tile = this.getTile(c, r);
-        if (tile) ctx.drawImage(tile, (c - c0) * this.cellW, (r - r0) * this.cellH);
+    ctx.fillStyle = `rgb(${GREEN[0]},${GREEN[1]},${GREEN[2]})`;
+    for (let dr = 0; dr < side; dr++) {
+      for (let dc = 0; dc < side; dc++) {
+        const c = sc0 + dc, r = sr0 + dr;
+        if (selectedSet.has(c + ',' + r)) {
+          ctx.fillRect(dc * this.cellW, dr * this.cellH, this.cellW, this.cellH);
+        }
       }
     }
     return canvas;
   }
 
-  regionHasContext(bounds) {
-    const [c0, r0, c1, r1] = bounds;
-    for (let r = r0; r <= r1; r++) {
-      for (let c = c0; c <= c1; c++) {
-        if (!this.isEmpty(c, r)) return true;
+  regionHasContext(square, selectedSet) {
+    const { sc0, sr0, side } = square;
+    for (let dr = 0; dr < side; dr++) {
+      for (let dc = 0; dc < side; dc++) {
+        const c = sc0 + dc, r = sr0 + dr;
+        if (!this.isEmpty(c, r) && !selectedSet.has(c + ',' + r)) return true;
       }
     }
     return false;
   }
 
-  regionIsFullyEmpty(cells) {
-    return cells.every(([c, r]) => this.isEmpty(c, r));
-  }
-
-  applyRegionImage(image, bounds, selected) {
-    const [c0, r0] = bounds;
+  /* Crop each selected cell out of the square result and store it. The result
+     image is square.px on a side and represents square.side cells, so one cell
+     occupies (px / side) px in the result. */
+  applySquareResult(image, square, selected, generationId) {
+    const { sc0, sr0, side, px } = square;
+    const cellPx = px / side;
     const changed = [];
     for (const [c, r] of selected) {
-      if (!this.inBounds(c, r) || !this.isEmpty(c, r)) continue;
+      if (!this.inBounds(c, r)) continue;
+      const dc = c - sc0, dr = r - sr0;
+      if (dc < 0 || dr < 0 || dc >= side || dr >= side) continue;
       const tile = newCanvas(this.cellW, this.cellH);
       tile.getContext('2d').drawImage(
         image,
-        (c - c0) * this.cellW, (r - r0) * this.cellH, this.cellW, this.cellH,
+        dc * cellPx, dr * cellPx, cellPx, cellPx,
         0, 0, this.cellW, this.cellH,
       );
-      this.setTile(c, r, tile);
+      this.setTile(c, r, tile, generationId);
       changed.push([c, r]);
     }
     return changed;
@@ -333,7 +457,7 @@ class MapModel {
     const tiles = [];
     for (const [k, tile] of this.tiles) {
       const [c, r] = k.split(',').map(Number);
-      tiles.push({ c, r, data: tile.toDataURL('image/png') });
+      tiles.push({ c, r, data: tile.toDataURL('image/png'), id: this.ids.get(k) || null });
     }
     return { cols: this.cols, rows: this.rows, cellW: this.cellW, cellH: this.cellH, tiles };
   }
@@ -344,7 +468,7 @@ class MapModel {
       img.onload = () => {
         const tile = newCanvas(model.cellW, model.cellH);
         tile.getContext('2d').drawImage(img, 0, 0, model.cellW, model.cellH);
-        model.setTile(t.c, t.r, tile);
+        model.setTile(t.c, t.r, tile, t.id || null);
         resolve();
       };
       img.onerror = () => resolve();
@@ -391,22 +515,35 @@ class LeonardoGenerator {
 
   async generateRegion(model, selected, prompt, refImages) {
     const bounds = MapModel.regionBounds(selected);
-    const [regionW, regionH] = model.regionPixelSize(bounds);
-    const hasContext = model.regionHasContext(bounds);
-    
-    const [width, height] = closestPair(regionW, regionH);
+    const selectedSet = new Set(selected.map(([c, r]) => c + ',' + r));
+    const square = model.squareTier(bounds);
+    if (!square) {
+      throw new Error(`Selection exceeds the ${MAX_TIER}x${MAX_TIER} tile limit.`);
+    }
+    const hasContext = model.regionHasContext(square, selectedSet);
+    const { px } = square;
+
+    console.log('Generation plan:', {
+      selectionBounds: bounds,
+      square,
+      requestSize: `${px}x${px}`,
+      hasContext,
+      selectedCells: selected,
+    });
 
     let text = prompt;
     const imageRefs = [];
 
-    if (hasContext) {
-      text += '\n\nThis is an image edit. Fill in the green areas only with ' +
-        'inpainting/outpainting to produce a single consistent image. Do not ' +
-        'change any non-green pixels.';
-      const region = model.buildRegionImage(bounds, selected); 
-      const id = await this.uploadImage(dataUrlToBlob(region.toDataURL('image/png')));
-      imageRefs.push({ image: { id, type: 'UPLOADED' }, strength: 'HIGH' });
-    }
+    // Always send the square context so the model knows the green cells to fill
+    // and the surrounding tiles to match.
+    text += '\n\nThis is an image edit on a square canvas. Fill ONLY the solid ' +
+      'green cells, painting a single seamless image that blends with the ' +
+      'surrounding non-green tiles. Do not change any non-green pixels.';
+    const contextCanvas = model.buildSquareContext(square, selectedSet);
+    const contextDataUrl = contextCanvas.toDataURL('image/png');
+    console.log('Context square (data URL length):', contextDataUrl.length);
+    const ctxId = await this.uploadImage(dataUrlToBlob(contextDataUrl));
+    imageRefs.push({ image: { id: ctxId, type: 'UPLOADED' }, strength: 'HIGH' });
 
     for (const ref of (refImages || [])) {
       const id = await this.uploadImage(dataUrlToBlob(`data:${ref.mimeType};base64,${ref.data}`));
@@ -414,8 +551,8 @@ class LeonardoGenerator {
     }
 
     const parameters = {
-      width,
-      height,
+      width: px,
+      height: px,
       prompt: text,
       quantity: 1, 
       prompt_enhance: 'OFF',
@@ -424,21 +561,22 @@ class LeonardoGenerator {
         parameters.guidances = { image_reference: imageRefs.slice(0, 6) };
     }
 
-    console.log("Sending V2 Payload:", JSON.stringify({ model: this.model, parameters, public: false }));
+    const payload = { model: this.model, parameters, public: false };
+    console.log('Sending V2 Payload:', payload);
 
     const resp = await fetch(LEO_V2_GENERATIONS, {
       method: 'POST',
       headers: { ...this.authHeaders, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: this.model, parameters, public: false }),
+      body: JSON.stringify(payload),
     });
     
     if (!resp.ok) throw new Error(await leoError(resp, 'starting the generation'));
 
     const job = await resp.json();
-    console.log("Job Response:", JSON.stringify(job));
+    console.log('Job Response (object):', job);
 
     const generationId = extractGenerationId(job);
-    recordGeneration({ generationId, response: job, prompt: text });
+    recordGeneration({ generationId, response: job, prompt: text, square });
     if (!generationId) {
       console.error('Could not parse a generation id from Leonardo response:', job);
       throw new Error('Leonardo did not return a generation id. Check console for raw response.');
@@ -448,9 +586,12 @@ class LeonardoGenerator {
     const url = await this.pollResult(generationId);
     const resultImg = await loadImageFromUrl(url);
 
-    const sized = newCanvas(regionW, regionH);
-    sized.getContext('2d').drawImage(resultImg, 0, 0, regionW, regionH);
-    return model.applyRegionImage(sized, bounds, selected);
+    // Normalize the result to the exact square size, then crop per cell.
+    const sized = newCanvas(px, px);
+    sized.getContext('2d').drawImage(resultImg, 0, 0, px, px);
+    const changed = model.applySquareResult(sized, square, selected, generationId);
+    console.log('Applied result, updated cells:', changed, 'generationId:', generationId);
+    return { changed, generationId };
   }
 
   async pollResult(generationId, { tries = 90, intervalMs = 2000 } = {}) {
@@ -461,13 +602,15 @@ class LeonardoGenerator {
         if (resp.status === 429 || resp.status >= 500) continue; 
         throw new Error(await leoError(resp, 'checking the generation status'));
       }
-      const gen = (await resp.json())?.generations_by_pk;
+      const polled = (await resp.json());
+      const gen = polled?.generations_by_pk;
       const status = gen?.status;
       
-      console.log(`Polling status: ${status}`);
+      console.log(`Polling status: ${status}`, gen);
 
       if (status === 'COMPLETE') {
         const images = gen.generated_images || gen.generatedImages || [];
+        recordGeneration({ generationId, polled, status });
         if (images.length > 0 && images[0]?.url) {
             return images[0].url;
         } else {
@@ -690,7 +833,14 @@ class MapApp {
 
   eraseSelection() {
     if (!this.selection.size) return;
-    for (const [c, r] of this.selectedCells()) this.model.clearTile(c, r);
+    const index = loadTileIndex();
+    for (const [c, r] of this.selectedCells()) {
+      this.model.clearTile(c, r);
+      const k = c + ',' + r;
+      delete index[k];
+      ImageDB.delete(k).catch((err) => console.warn('Could not delete cached tile', k, err));
+    }
+    saveTileIndex(index);
     this.redraw();
   }
 
@@ -732,12 +882,14 @@ class MapApp {
 
   async onGenerate() {
     if (this.busy) return;
-    if (!this.selection.size) {
-      Swal.fire({ icon: 'info', title: 'Generate', text: 'Select one or more tiles first.' });
+    const selected = this.selectedCells();
+    const check = validateSelection(selected);
+    if (!check.ok) {
+      console.warn('Selection rejected:', check, selected);
+      Swal.fire({ icon: 'info', title: 'Adjust selection', text: check.reason });
       return;
     }
-    const selected = this.selectedCells();
-    const partial = !this.model.regionIsFullyEmpty(selected);
+    const partial = selected.some(([c, r]) => !this.model.isEmpty(c, r));
     const verb = partial ? 'Inpaint' : 'Outpaint';
 
     const { value: prompt } = await Swal.fire({
@@ -759,10 +911,12 @@ class MapApp {
       if (!this.generator) {
         this.generator = new LeonardoGenerator(this.config.apiKey, this.config.modelName);
       }
-      const changed = await this.generator.generateRegion(this.model, selected, prompt, this.refs);
+      const { changed, generationId } =
+        await this.generator.generateRegion(this.model, selected, prompt, this.refs);
+      await this.persistCells(changed, generationId);
       Swal.close();
       this.redraw();
-      this.setStatus(`Done. Updated ${changed.length} tile(s).`);
+      this.setStatus(`Done. Updated ${changed.length} tile(s). generationId ${generationId}.`);
     } catch (err) {
       Swal.close();
       console.error('Generation failed:', err);
@@ -771,6 +925,25 @@ class MapApp {
     } finally {
       this.busy = false;
     }
+  }
+
+  /* Save each freshly produced cell's image (IndexedDB) and its x,y -> id map
+     (localStorage) so a reload re-renders it without re-downloading. */
+  async persistCells(cells, generationId) {
+    const index = loadTileIndex();
+    for (const [c, r] of cells) {
+      const k = c + ',' + r;
+      const tile = this.model.getTile(c, r);
+      if (!tile) continue;
+      try {
+        await ImageDB.put(k, { dataUrl: tile.toDataURL('image/png'), id: generationId, c, r });
+        index[k] = { c, r, id: generationId };
+      } catch (err) {
+        console.warn('Could not cache tile', k, err);
+      }
+    }
+    saveTileIndex(index);
+    console.log('Persisted cells to IndexedDB + tile index:', cells, 'id:', generationId);
   }
 
   exportPNG() {
@@ -821,6 +994,14 @@ class MapApp {
     ctx.fillStyle = '#101010';
     ctx.fillRect(0, 0, W, H);
 
+    if (W === 0 || H === 0) {
+      // Layout not ready yet: try again on the next frame instead of drawing
+      // nothing (this was a cause of the grid silently never appearing).
+      console.warn('Canvas has zero size; deferring redraw.');
+      requestAnimationFrame(() => { this._resizeCanvas(); this.redraw(); });
+      return;
+    }
+
     const c0 = Math.max(0, Math.floor((-this.panX) / dw));
     const r0 = Math.max(0, Math.floor((-this.panY) / dh));
     const c1 = Math.min(this.model.cols - 1, Math.floor((W - this.panX) / dw));
@@ -833,27 +1014,46 @@ class MapApp {
         if (tile) {
           ctx.drawImage(tile, x, y, dw, dh);
         } else {
-          ctx.fillStyle = '#000000';
+          // Checkerboard so empty cells (and therefore the grid) are always
+          // visible, even on a brand-new all-black map.
+          ctx.fillStyle = ((c + r) & 1) ? EMPTY_CELL_ALT : EMPTY_CELL;
           ctx.fillRect(x, y, dw, dh);
         }
       }
     }
 
-    if (dw >= 3 && dh >= 3) {
-      ctx.strokeStyle = GRID_COLOR;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      for (let c = c0; c <= c1 + 1; c++) {
-        const x = Math.round(this.panX + c * dw) + 0.5;
-        ctx.moveTo(x, this.panY + r0 * dh);
-        ctx.lineTo(x, this.panY + (r1 + 1) * dh);
+    // Grid lines. Always draw something: at fine zoom draw every cell border;
+    // once cells get small, thin the lines out (every Nth) so a grid is still
+    // visible instead of vanishing entirely.
+    const step = dw >= 6 ? 1 : Math.ceil(8 / dw);
+    ctx.strokeStyle = step === 1 ? GRID_COLOR : GRID_COLOR_MAJOR;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let c = c0 - (c0 % step); c <= c1 + 1; c += step) {
+      const x = Math.round(this.panX + c * dw) + 0.5;
+      ctx.moveTo(x, this.panY + r0 * dh);
+      ctx.lineTo(x, this.panY + (r1 + 1) * dh);
+    }
+    for (let r = r0 - (r0 % step); r <= r1 + 1; r += step) {
+      const y = Math.round(this.panY + r * dh) + 0.5;
+      ctx.moveTo(this.panX + c0 * dw, y);
+      ctx.lineTo(this.panX + (c1 + 1) * dw, y);
+    }
+    ctx.stroke();
+
+    // Paint each generated cell with the short form of its generation id, so
+    // the user can see which id produced which square.
+    if (dw >= 40 && dh >= 16) {
+      ctx.font = `${Math.max(8, Math.min(14, Math.floor(dh / 6)))}px monospace`;
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.textBaseline = 'top';
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const id = this.model.getId(c, r);
+          if (!id) continue;
+          ctx.fillText(String(id).slice(0, 8), this.panX + c * dw + 3, this.panY + r * dh + 3);
+        }
       }
-      for (let r = r0; r <= r1 + 1; r++) {
-        const y = Math.round(this.panY + r * dh) + 0.5;
-        ctx.moveTo(this.panX + c0 * dw, y);
-        ctx.lineTo(this.panX + (c1 + 1) * dw, y);
-      }
-      ctx.stroke();
     }
 
     ctx.fillStyle = SELECT_FILL;
@@ -1001,6 +1201,39 @@ async function askNewMap() {
   return value || null;
 }
 
+/* Repopulate a fresh model from previously cached tiles (IndexedDB images +
+   localStorage x,y->id index) so a reload shows prior work without re-billing
+   the API. */
+async function restorePersistedTiles(model) {
+  const index = loadTileIndex();
+  const entries = Object.values(index);
+  if (!entries.length) return 0;
+  let restored = 0;
+  await Promise.all(entries.map(async ({ c, r, id }) => {
+    if (!model.inBounds(c, r)) return;
+    try {
+      const rec = await ImageDB.get(c + ',' + r);
+      if (!rec || !rec.dataUrl) return;
+      await new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          const tile = newCanvas(model.cellW, model.cellH);
+          tile.getContext('2d').drawImage(img, 0, 0, model.cellW, model.cellH);
+          model.setTile(c, r, tile, id || rec.id || null);
+          restored++;
+          resolve();
+        };
+        img.onerror = () => resolve();
+        img.src = rec.dataUrl;
+      });
+    } catch (err) {
+      console.warn('Could not restore tile', c, r, err);
+    }
+  }));
+  console.log('Restored persisted tiles:', restored);
+  return restored;
+}
+
 (async function main() {
   const config = await askApiSettings(loadConfig());
   if (!config) { document.getElementById('status').textContent = 'Cancelled.'; return; }
@@ -1010,8 +1243,14 @@ async function askNewMap() {
   if (!dims) { document.getElementById('status').textContent = 'Cancelled.'; return; }
 
   const model = new MapModel(dims.cols, dims.rows, dims.cw, dims.ch);
+  try {
+    await restorePersistedTiles(model);
+  } catch (err) {
+    console.warn('Tile restore failed:', err);
+  }
   const app = new MapApp(model, config);
   window.__mapApp = app; 
+  console.log('Map app ready:', { cols: model.cols, rows: model.rows, cellW: model.cellW, cellH: model.cellH });
 })();
 </script>
 </body>
