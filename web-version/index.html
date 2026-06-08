@@ -133,6 +133,13 @@ import Swal from 'https://cdn.jsdelivr.net/npm/sweetalert2@11/+esm';
 const START_ZOOM = 2;
 const MIN_ZOOM = 0.02;
 const MAX_ZOOM = 4.0;
+/* On a fresh map we want the whole tile grid to be visible as small squares,
+   anchored to the top-left corner. We pick a zoom so each cell shows at roughly
+   this many on-screen pixels (e.g. a 1024px tile -> ~0.1 zoom). */
+const INITIAL_CELL_PX = 100;
+
+const STORAGE_KEY_CONFIG = 'mapgen.apiConfig';
+const STORAGE_KEY_GENERATIONS = 'mapgen.generations';
 const GRID_COLOR = '#3a4250';      
 const SELECT_OUTLINE = '#39c0ff';
 const SELECT_FILL = 'rgba(57,192,255,0.30)';
@@ -182,6 +189,36 @@ function dataUrlToBlob(dataUrl) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ----------------------------------------------------- persistent storage */
+function loadConfig() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_CONFIG);
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    console.warn('Could not read saved API settings:', err);
+    return {};
+  }
+}
+
+function saveConfig(config) {
+  try {
+    localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(config));
+  } catch (err) {
+    console.warn('Could not persist API settings:', err);
+  }
+}
+
+function recordGeneration(record) {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_GENERATIONS);
+    const list = raw ? JSON.parse(raw) : [];
+    list.push({ ...record, savedAt: new Date().toISOString() });
+    localStorage.setItem(STORAGE_KEY_GENERATIONS, JSON.stringify(list.slice(-100)));
+  } catch (err) {
+    console.warn('Could not persist generation response:', err);
+  }
+}
 
 function newCanvas(w, h) {
   const c = document.createElement('canvas');
@@ -398,12 +435,15 @@ class LeonardoGenerator {
     if (!resp.ok) throw new Error(await leoError(resp, 'starting the generation'));
 
     const job = await resp.json();
-    console.log("Job Response:", job);
+    console.log("Job Response:", JSON.stringify(job));
 
     const generationId = extractGenerationId(job);
+    recordGeneration({ generationId, response: job, prompt: text });
     if (!generationId) {
+      console.error('Could not parse a generation id from Leonardo response:', job);
       throw new Error('Leonardo did not return a generation id. Check console for raw response.');
     }
+    console.log('Parsed generationId:', generationId);
 
     const url = await this.pollResult(generationId);
     const resultImg = await loadImageFromUrl(url);
@@ -442,7 +482,9 @@ class LeonardoGenerator {
 }
 
 function extractGenerationId(json) {
-  return json?.sdGenerationJob?.generationId
+  return json?.generate?.generationId
+    || json?.generate?.generation_id
+    || json?.sdGenerationJob?.generationId
     || json?.generationId
     || json?.generation_id
     || json?.id
@@ -497,11 +539,19 @@ class MapApp {
 
     this._wireUI();
     this._resizeCanvas();
-    
-    this.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, START_ZOOM));
+
+    /* Start zoomed out enough to see the tile grid as squares, anchored to the
+       top-left corner of the map. */
+    this.zoom = this.initialZoom();
     this.panX = 0;
     this.panY = 0;
     requestAnimationFrame(() => { this._resizeCanvas(); this.redraw(); });
+  }
+
+  initialZoom() {
+    const cell = Math.max(this.model.cellW, this.model.cellH);
+    const zoom = INITIAL_CELL_PX / cell;
+    return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
   }
 
   get dispW() { return Math.max(1, Math.round(this.model.cellW * this.zoom)); }
@@ -715,6 +765,7 @@ class MapApp {
       this.setStatus(`Done. Updated ${changed.length} tile(s).`);
     } catch (err) {
       Swal.close();
+      console.error('Generation failed:', err);
       Swal.fire({ icon: 'error', title: 'Generation failed', text: String(err.message || err) });
       this.setStatus('Generation failed.');
     } finally {
@@ -756,6 +807,7 @@ class MapApp {
     const cfg = await askApiSettings(this.config);
     if (cfg) {
       this.config = cfg;
+      saveConfig(cfg);
       this.generator = null; 
       this.setStatus('Updated API settings.');
     }
@@ -950,8 +1002,9 @@ async function askNewMap() {
 }
 
 (async function main() {
-  const config = await askApiSettings();
+  const config = await askApiSettings(loadConfig());
   if (!config) { document.getElementById('status').textContent = 'Cancelled.'; return; }
+  saveConfig(config);
 
   const dims = await askNewMap();
   if (!dims) { document.getElementById('status').textContent = 'Cancelled.'; return; }
