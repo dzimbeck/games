@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Village Map</title>
+	<style>
+		.header {
+			background-color: black;
+			border: 2px solid blue;
+			color: white;
+			text-align: center;
+			padding: 10px;
+		}
+		.dropdown {
+			position: relative;
+			display: inline-block;
+		}
+		.dropdown-content {
+			display: none;
+			position: absolute;
+			background-color: #f9f9f9;
+			min-width: 160px;
+			box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+			z-index: 1000;
+		}
+		.dropdown:hover .dropdown-content {
+			display: block;
+		}
+		.dropdown-content a {
+			color: black;
+			padding: 12px 16px;
+			text-decoration: none;
+			display: block;
+		}
+		.dropdown-content a:hover {
+			background-color: #f1f1f1;
+		}
+
+		body {
+			font-family: Arial, Helvetica, sans-serif;
+			margin: 0;
+			background: #fafafa;
+			color: #222;
+		}
+		h2, h3 { margin: 8px 0; }
+		.wrap { max-width: 1100px; margin: 0 auto; padding: 12px; }
+		.toolbar {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 10px;
+			align-items: center;
+			padding: 8px;
+			background: #fff;
+			border: 1px solid #ddd;
+			border-radius: 6px;
+			margin-bottom: 10px;
+		}
+		.toolbar .group {
+			display: flex;
+			gap: 6px;
+			align-items: center;
+			padding: 4px 8px;
+			border-right: 1px solid #eee;
+		}
+		button {
+			cursor: pointer;
+			padding: 6px 10px;
+			border: 1px solid #bbb;
+			border-radius: 4px;
+			background: #f4f4f4;
+		}
+		button:hover { background: #e9e9e9; }
+		button.active { background: #2d6cdf; color: #fff; border-color: #2d6cdf; }
+		button:disabled { opacity: 0.5; cursor: not-allowed; }
+		input[type="number"] { width: 70px; }
+		input[type="text"] { padding: 4px; }
+
+		#mapViewport {
+			position: relative;
+			width: 100%;
+			height: 600px;
+			border: 1px solid #ccc;
+			background: #2b2b2b;
+			overflow: hidden;
+			border-radius: 6px;
+		}
+		#mapCanvas { position: absolute; left: 0; top: 0; image-rendering: pixelated; }
+		#mapCanvas.placing { cursor: crosshair; }
+		#mapCanvas.grabbing { cursor: grabbing; }
+
+		/* Soft popup */
+		#popup {
+			position: absolute;
+			min-width: 180px;
+			max-width: 260px;
+			background: rgba(255,255,255,0.97);
+			border: 1px solid #ccc;
+			border-radius: 8px;
+			box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+			padding: 10px;
+			font-size: 13px;
+			opacity: 0;
+			transform: translateY(6px);
+			transition: opacity 0.18s ease, transform 0.18s ease;
+			pointer-events: none;
+			z-index: 50;
+		}
+		#popup.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+		#popup .close { float: right; cursor: pointer; color: #888; font-weight: bold; }
+		#popup label { display: block; margin: 6px 0 2px; font-weight: bold; }
+		#popup textarea { width: 100%; box-sizing: border-box; min-height: 60px; }
+		#popup .row { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+
+		.palettes { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; }
+		.palette {
+			flex: 1 1 320px;
+			background: #fff;
+			border: 1px solid #ddd;
+			border-radius: 6px;
+			padding: 10px;
+		}
+		.palette .list { max-height: 280px; overflow-y: auto; }
+		.swatchRow { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+		.swatch { width: 22px; height: 22px; border: 1px solid #999; border-radius: 3px; flex: 0 0 auto; }
+		.swatchRow .count { color: #888; font-size: 11px; width: 64px; flex: 0 0 auto; }
+		.swatchRow input { flex: 1 1 auto; }
+		.muted { color: #888; font-size: 12px; }
+		.status { font-size: 12px; color: #444; }
+	</style>
+</head>
+<body>
+	<div class="header">
+		<div class="dropdown">
+			<button class="dropbtn">Select a Game</button>
+			<div class="dropdown-content">
+				<a href="index.html">Maze</a>
+				<a href="index2.html">Unfair Pong</a>
+				<a href="index3.html">Dodging Rain</a>
+				<a href="index4.html">Catch a Rain Drop</a>
+				<a href="index5.html">Village Map</a>
+			</div>
+		</div>
+	</div>
+
+	<div class="wrap">
+		<h2>Village Map</h2>
+
+		<div class="toolbar">
+			<div class="group">
+				<label>Map image: <input type="file" id="mapFile" accept="image/png,image/jpeg,image/*"></label>
+			</div>
+			<div class="group">
+				<label>Tiers image: <input type="file" id="tierFile" accept="image/png,image/jpeg,image/*"></label>
+			</div>
+			<div class="group">
+				<button id="viewBiome" class="active">Biome view</button>
+				<button id="viewTier">Tier view</button>
+			</div>
+			<div class="group">
+				<button id="zoomOut">&minus;</button>
+				<button id="zoomIn">+</button>
+				<button id="zoomReset">Fit</button>
+			</div>
+			<div class="group">
+				<button id="clearAll" title="Clear all saved data">Reset saved data</button>
+			</div>
+		</div>
+
+		<div class="toolbar">
+			<div class="group">
+				<strong>Villages</strong>
+			</div>
+			<div class="group">
+				<label>Color <input type="color" id="vColor"></label>
+				<button id="vRandomColor" title="Pick a new random color">&#127922;</button>
+			</div>
+			<div class="group">
+				<label>Width(px) <input type="number" id="vWidth" min="1" value="6"></label>
+				<label>Height(px) <input type="number" id="vHeight" min="1" value="6"></label>
+			</div>
+			<div class="group">
+				<label>Min distance(px) <input type="number" id="vMinDist" min="0" value="20"></label>
+			</div>
+			<div class="group">
+				<label>Count <input type="number" id="vCount" min="1" value="1"></label>
+				<button id="placeRandom">Place random</button>
+			</div>
+			<div class="group">
+				<button id="placeManual">Place manually</button>
+			</div>
+			<div class="group">
+				<button id="clearVillages">Remove all villages</button>
+			</div>
+		</div>
+
+		<div class="status" id="status">Load a 690x690 map image to begin.</div>
+
+		<div id="mapViewport">
+			<canvas id="mapCanvas"></canvas>
+			<div id="popup"></div>
+		</div>
+
+		<div class="palettes">
+			<div class="palette">
+				<h3>Biome labels <span class="muted" id="biomeCount"></span></h3>
+				<div class="muted">Label each map color. Use the word "water" for impassable water biomes.</div>
+				<div class="list" id="biomeList"></div>
+			</div>
+			<div class="palette">
+				<h3>Tier labels <span class="muted" id="tierCount"></span></h3>
+				<div class="muted">Label each tier color. Villages may only be placed on tiers whose name contains 1, 2 or 3.</div>
+				<div class="list" id="tierList"></div>
+			</div>
+		</div>
+	</div>
+
+	<script>
+	"use strict";
+
+	// ---- Storage keys ----
+	var LS = {
+		mapImage: "villageMap.mapImage",
+		tierImage: "villageMap.tierImage",
+		biomeLabels: "villageMap.biomeLabels",
+		tierLabels: "villageMap.tierLabels",
+		villages: "villageMap.villages",
+		settings: "villageMap.settings"
+	};
+
+	// ---- State ----
+	var state = {
+		W: 0, H: 0,                 // grid dimensions (map natural size)
+		mapImg: null, tierImg: null,
+		mapData: null, tierData: null, // ImageData for pixel reads
+		biomeLabels: {},            // hex -> name
+		tierLabels: {},             // hex -> name
+		villages: [],               // {x,y,w,h,color,desc}
+		view: "biome",
+		zoom: 1, offsetX: 0, offsetY: 0,
+		placingManual: false,
+		hoverPx: null               // {x,y} grid pixel under cursor while placing
+	};
+
+	var viewport = document.getElementById("mapViewport");
+	var canvas = document.getElementById("mapCanvas");
+	var ctx = canvas.getContext("2d");
+	var popup = document.getElementById("popup");
+	var statusEl = document.getElementById("status");
+
+	function setStatus(msg) { statusEl.textContent = msg; }
+
+	// ---- Helpers ----
+	function toHex(r, g, b) {
+		return "#" + [r, g, b].map(function (v) {
+			var s = v.toString(16);
+			return s.length === 1 ? "0" + s : s;
+		}).join("");
+	}
+
+	function randomColor() {
+		return toHex(
+			Math.floor(Math.random() * 256),
+			Math.floor(Math.random() * 256),
+			Math.floor(Math.random() * 256)
+		);
+	}
+
+	function loadJSON(key, fallback) {
+		try {
+			var raw = localStorage.getItem(key);
+			return raw ? JSON.parse(raw) : fallback;
+		} catch (e) { return fallback; }
+	}
+	function saveJSON(key, val) {
+		try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+	}
+
+	// Build ImageData for an image at the grid (W x H) resolution.
+	function imageToData(img, w, h) {
+		var c = document.createElement("canvas");
+		c.width = w; c.height = h;
+		var cc = c.getContext("2d");
+		cc.imageSmoothingEnabled = false;
+		cc.drawImage(img, 0, 0, w, h);
+		return cc.getImageData(0, 0, w, h);
+	}
+
+	// Scan an ImageData for the full color palette (hex -> pixel count).
+	function scanPalette(data) {
+		var counts = {};
+		var d = data.data;
+		for (var i = 0; i < d.length; i += 4) {
+			var hex = toHex(d[i], d[i + 1], d[i + 2]);
+			counts[hex] = (counts[hex] || 0) + 1;
+		}
+		return counts;
+	}
+
+	// Color at grid pixel (x,y) for given ImageData.
+	function colorAt(data, x, y) {
+		if (!data) return null;
+		if (x < 0 || y < 0 || x >= data.width || y >= data.height) return null;
+		var i = (y * data.width + x) * 4;
+		var d = data.data;
+		return toHex(d[i], d[i + 1], d[i + 2]);
+	}
+
+	function biomeName(hex) {
+		return (hex && state.biomeLabels[hex]) || "";
+	}
+	function tierName(hex) {
+		return (hex && state.tierLabels[hex]) || "";
+	}
+
+	// A tier name is valid for villages if it contains 1, 2 or 3.
+	function tierAllowsVillage(name) {
+		return /[123]/.test(name || "");
+	}
+	function biomeIsWater(name) {
+		return /water/i.test(name || "");
+	}
+
+	// ---- Rendering ----
+	function currentImg() {
+		return state.view === "tier" ? state.tierImg : state.mapImg;
+	}
+
+	function resizeCanvas() {
+		canvas.width = viewport.clientWidth;
+		canvas.height = viewport.clientHeight;
+	}
+
+	function fitToViewport() {
+		if (!state.W) return;
+		var s = Math.min(canvas.width / state.W, canvas.height / state.H);
+		state.zoom = s > 0 ? s : 1;
+		state.offsetX = (canvas.width - state.W * state.zoom) / 2;
+		state.offsetY = (canvas.height - state.H * state.zoom) / 2;
+	}
+
+	function draw() {
+		ctx.clearRect(0, 0, canvas.width, canvas.height);
+		var img = currentImg();
+		if (!img) return;
+		ctx.imageSmoothingEnabled = false;
+		ctx.drawImage(img, state.offsetX, state.offsetY, state.W * state.zoom, state.H * state.zoom);
+
+		// Villages
+		for (var i = 0; i < state.villages.length; i++) {
+			var v = state.villages[i];
+			ctx.fillStyle = v.color;
+			ctx.globalAlpha = 0.85;
+			ctx.fillRect(
+				state.offsetX + v.x * state.zoom,
+				state.offsetY + v.y * state.zoom,
+				v.w * state.zoom,
+				v.h * state.zoom
+			);
+			ctx.globalAlpha = 1;
+			ctx.strokeStyle = "rgba(0,0,0,0.6)";
+			ctx.lineWidth = 1;
+			ctx.strokeRect(
+				state.offsetX + v.x * state.zoom,
+				state.offsetY + v.y * state.zoom,
+				v.w * state.zoom,
+				v.h * state.zoom
+			);
+		}
+
+		// Manual placement hover highlight
+		if (state.placingManual && state.hoverPx) {
+			var dims = getVillageDims();
+			var hx = state.hoverPx.x - Math.floor(dims.w / 2);
+			var hy = state.hoverPx.y - Math.floor(dims.h / 2);
+			ctx.strokeStyle = "#ffffff";
+			ctx.lineWidth = 2;
+			ctx.strokeRect(
+				state.offsetX + hx * state.zoom,
+				state.offsetY + hy * state.zoom,
+				dims.w * state.zoom,
+				dims.h * state.zoom
+			);
+			ctx.fillStyle = "rgba(255,255,255,0.25)";
+			ctx.fillRect(
+				state.offsetX + hx * state.zoom,
+				state.offsetY + hy * state.zoom,
+				dims.w * state.zoom,
+				dims.h * state.zoom
+			);
+		}
+	}
+
+	// ---- Coordinate mapping ----
+	function screenToGrid(clientX, clientY) {
+		var rect = canvas.getBoundingClientRect();
+		var sx = clientX - rect.left;
+		var sy = clientY - rect.top;
+		return {
+			x: Math.floor((sx - state.offsetX) / state.zoom),
+			y: Math.floor((sy - state.offsetY) / state.zoom)
+		};
+	}
+
+	// ---- Palette UI ----
+	function renderPalette(listEl, counts, labels, key, countEl) {
+		listEl.innerHTML = "";
+		var hexes = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
+		if (countEl) countEl.textContent = "(" + hexes.length + " colors)";
+		hexes.forEach(function (hex) {
+			var row = document.createElement("div");
+			row.className = "swatchRow";
+
+			var sw = document.createElement("div");
+			sw.className = "swatch";
+			sw.style.background = hex;
+
+			var cnt = document.createElement("span");
+			cnt.className = "count";
+			cnt.textContent = hex + " ·" + counts[hex];
+
+			var inp = document.createElement("input");
+			inp.type = "text";
+			inp.placeholder = "label";
+			inp.value = labels[hex] || "";
+			inp.addEventListener("input", function () {
+				labels[hex] = inp.value;
+				saveJSON(key, labels);
+			});
+
+			row.appendChild(sw);
+			row.appendChild(cnt);
+			row.appendChild(inp);
+			listEl.appendChild(row);
+		});
+	}
+
+	function renderBiomePalette() {
+		if (!state.mapData) return;
+		renderPalette(
+			document.getElementById("biomeList"),
+			scanPalette(state.mapData),
+			state.biomeLabels, LS.biomeLabels,
+			document.getElementById("biomeCount")
+		);
+	}
+	function renderTierPalette() {
+		if (!state.tierData) return;
+		renderPalette(
+			document.getElementById("tierList"),
+			scanPalette(state.tierData),
+			state.tierLabels, LS.tierLabels,
+			document.getElementById("tierCount")
+		);
+	}
+
+	// ---- Image loading ----
+	function loadImageFromSrc(src) {
+		return new Promise(function (resolve, reject) {
+			var img = new Image();
+			img.onload = function () { resolve(img); };
+			img.onerror = reject;
+			img.src = src;
+		});
+	}
+
+	function applyMapImage(img) {
+		state.mapImg = img;
+		// Grid dimensions follow the map image's natural size.
+		state.W = img.naturalWidth || img.width;
+		state.H = img.naturalHeight || img.height;
+		state.mapData = imageToData(img, state.W, state.H);
+		renderBiomePalette();
+		// Re-derive tier data at the (possibly new) grid resolution.
+		if (state.tierImg) state.tierData = imageToData(state.tierImg, state.W, state.H);
+		fitToViewport();
+		draw();
+		setStatus("Map loaded (" + state.W + "x" + state.H + "). " +
+			(state.tierImg ? "" : "Now load a tiers image."));
+	}
+
+	function applyTierImage(img) {
+		state.tierImg = img;
+		var w = state.W || img.naturalWidth || img.width;
+		var h = state.H || img.naturalHeight || img.height;
+		state.tierData = imageToData(img, w, h);
+		renderTierPalette();
+		draw();
+		setStatus("Tiers image loaded.");
+	}
+
+	function handleFile(file, isTier) {
+		var reader = new FileReader();
+		reader.onload = function () {
+			var dataUrl = reader.result;
+			loadImageFromSrc(dataUrl).then(function (img) {
+				if (isTier) {
+					saveJSON(LS.tierImage, dataUrl);
+					applyTierImage(img);
+				} else {
+					saveJSON(LS.mapImage, dataUrl);
+					applyMapImage(img);
+				}
+			});
+		};
+		reader.readAsDataURL(file);
+	}
+
+	// ---- Village placement ----
+	function getVillageDims() {
+		return {
+			w: Math.max(1, parseInt(document.getElementById("vWidth").value, 10) || 1),
+			h: Math.max(1, parseInt(document.getElementById("vHeight").value, 10) || 1)
+		};
+	}
+
+	// Edge-to-edge separation distance between two rectangles.
+	function rectSeparation(a, b) {
+		var dx = Math.max(0, Math.max(a.x - (b.x + b.w), b.x - (a.x + a.w)));
+		var dy = Math.max(0, Math.max(a.y - (b.y + b.h), b.y - (a.y + a.h)));
+		return Math.sqrt(dx * dx + dy * dy);
+	}
+
+	// Check whether a rectangle is a valid placement spot.
+	function isValidSpot(rect, minDist) {
+		if (rect.x < 0 || rect.y < 0 || rect.x + rect.w > state.W || rect.y + rect.h > state.H) {
+			return false;
+		}
+		// Every pixel must be on land (no "water" biome) and on a tier 1/2/3.
+		for (var py = rect.y; py < rect.y + rect.h; py++) {
+			for (var px = rect.x; px < rect.x + rect.w; px++) {
+				var bName = biomeName(colorAt(state.mapData, px, py));
+				if (biomeIsWater(bName)) return false;
+				var tName = tierName(colorAt(state.tierData, px, py));
+				if (!tierAllowsVillage(tName)) return false;
+			}
+		}
+		// Respect minimum distance from existing villages.
+		for (var i = 0; i < state.villages.length; i++) {
+			if (rectSeparation(rect, state.villages[i]) < minDist) return false;
+		}
+		return true;
+	}
+
+	function placeRandomVillages() {
+		if (!state.mapData || !state.tierData) {
+			setStatus("Load both the map and the tiers image first.");
+			return;
+		}
+		var dims = getVillageDims();
+		var minDist = Math.max(0, parseInt(document.getElementById("vMinDist").value, 10) || 0);
+		var color = document.getElementById("vColor").value;
+		var count = Math.max(1, parseInt(document.getElementById("vCount").value, 10) || 1);
+
+		var placed = 0, failures = 0;
+		for (var n = 0; n < count; n++) {
+			var attempts = 0, ok = false;
+			while (attempts < 100) {
+				var rect = {
+					x: Math.floor(Math.random() * (state.W - dims.w + 1)),
+					y: Math.floor(Math.random() * (state.H - dims.h + 1)),
+					w: dims.w, h: dims.h
+				};
+				if (isValidSpot(rect, minDist)) {
+					state.villages.push({
+						x: rect.x, y: rect.y, w: rect.w, h: rect.h,
+						color: color, desc: ""
+					});
+					placed++;
+					ok = true;
+					break;
+				}
+				attempts++;
+			}
+			if (!ok) {
+				failures++;
+				// 100 consecutive failures: stop trying this village.
+				setStatus("Could not place a village after 100 attempts (placed " +
+					placed + " of " + count + ").");
+				break;
+			}
+		}
+		if (failures === 0) {
+			setStatus("Placed " + placed + " village(s).");
+		}
+		saveJSON(LS.villages, state.villages);
+		draw();
+	}
+
+	// ---- Popups ----
+	function hidePopup() {
+		popup.classList.remove("show");
+		setTimeout(function () { if (!popup.classList.contains("show")) popup.innerHTML = ""; }, 200);
+	}
+
+	function positionPopup(clientX, clientY) {
+		var rect = viewport.getBoundingClientRect();
+		var x = clientX - rect.left + 12;
+		var y = clientY - rect.top + 12;
+		// Keep within the viewport.
+		x = Math.min(x, viewport.clientWidth - 200);
+		y = Math.min(y, viewport.clientHeight - 120);
+		popup.style.left = Math.max(4, x) + "px";
+		popup.style.top = Math.max(4, y) + "px";
+	}
+
+	function showInfoPopup(gridPt, clientX, clientY) {
+		var bName = biomeName(colorAt(state.mapData, gridPt.x, gridPt.y)) || "(unlabeled)";
+		var tName = tierName(colorAt(state.tierData, gridPt.x, gridPt.y)) || "(unlabeled)";
+		popup.innerHTML =
+			'<span class="close" id="popClose">&times;</span>' +
+			'<div><strong>Square</strong> (' + gridPt.x + ', ' + gridPt.y + ')</div>' +
+			'<div><strong>Biome:</strong> ' + escapeHtml(bName) + '</div>' +
+			'<div><strong>Tier:</strong> ' + escapeHtml(tName) + '</div>';
+		positionPopup(clientX, clientY);
+		popup.classList.add("show");
+		document.getElementById("popClose").onclick = hidePopup;
+	}
+
+	function showVillagePopup(index, clientX, clientY) {
+		var v = state.villages[index];
+		popup.innerHTML =
+			'<span class="close" id="popClose">&times;</span>' +
+			'<div><strong>Village</strong> (' + v.x + ', ' + v.y + ')</div>' +
+			'<label for="vDesc">Description</label>' +
+			'<textarea id="vDesc" placeholder="guilds, special buildings...">' + escapeHtml(v.desc || "") + '</textarea>' +
+			'<div class="row"><label for="vEditColor">Color</label>' +
+			'<input type="color" id="vEditColor" value="' + v.color + '"></div>' +
+			'<div class="row">' +
+			'<button id="vSave">Save</button>' +
+			'<button id="vDelete">Delete</button></div>';
+		positionPopup(clientX, clientY);
+		popup.classList.add("show");
+		document.getElementById("popClose").onclick = hidePopup;
+		document.getElementById("vSave").onclick = function () {
+			v.desc = document.getElementById("vDesc").value;
+			v.color = document.getElementById("vEditColor").value;
+			saveJSON(LS.villages, state.villages);
+			draw();
+			hidePopup();
+		};
+		document.getElementById("vDelete").onclick = function () {
+			state.villages.splice(index, 1);
+			saveJSON(LS.villages, state.villages);
+			draw();
+			hidePopup();
+		};
+	}
+
+	function escapeHtml(s) {
+		return String(s).replace(/[&<>"']/g, function (c) {
+			return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+		});
+	}
+
+	function villageAt(gridPt) {
+		// Topmost village wins (iterate in reverse draw order).
+		for (var i = state.villages.length - 1; i >= 0; i--) {
+			var v = state.villages[i];
+			if (gridPt.x >= v.x && gridPt.x < v.x + v.w &&
+				gridPt.y >= v.y && gridPt.y < v.y + v.h) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	// ---- Pointer interaction (pan / zoom / click / manual place) ----
+	var dragging = false, dragMoved = false, lastX = 0, lastY = 0;
+
+	canvas.addEventListener("mousedown", function (e) {
+		dragging = true;
+		dragMoved = false;
+		lastX = e.clientX;
+		lastY = e.clientY;
+		if (!state.placingManual) canvas.classList.add("grabbing");
+	});
+
+	window.addEventListener("mousemove", function (e) {
+		if (dragging && !state.placingManual) {
+			var dx = e.clientX - lastX;
+			var dy = e.clientY - lastY;
+			if (Math.abs(dx) + Math.abs(dy) > 3) dragMoved = true;
+			state.offsetX += dx;
+			state.offsetY += dy;
+			lastX = e.clientX;
+			lastY = e.clientY;
+			draw();
+		}
+	});
+
+	canvas.addEventListener("mousemove", function (e) {
+		if (state.placingManual && state.W) {
+			state.hoverPx = screenToGrid(e.clientX, e.clientY);
+			draw();
+		}
+	});
+
+	window.addEventListener("mouseup", function (e) {
+		if (!dragging) return;
+		dragging = false;
+		canvas.classList.remove("grabbing");
+		if (!state.W) return;
+		var gridPt = screenToGrid(e.clientX, e.clientY);
+
+		if (state.placingManual) {
+			placeManualAt(gridPt);
+			return;
+		}
+		if (dragMoved) return; // it was a pan, not a click
+
+		// Click: village edit takes priority, otherwise show square info.
+		var vi = villageAt(gridPt);
+		if (vi >= 0) {
+			showVillagePopup(vi, e.clientX, e.clientY);
+		} else if (gridPt.x >= 0 && gridPt.y >= 0 && gridPt.x < state.W && gridPt.y < state.H) {
+			showInfoPopup(gridPt, e.clientX, e.clientY);
+		} else {
+			hidePopup();
+		}
+	});
+
+	function placeManualAt(gridPt) {
+		var dims = getVillageDims();
+		var rect = {
+			x: gridPt.x - Math.floor(dims.w / 2),
+			y: gridPt.y - Math.floor(dims.h / 2),
+			w: dims.w, h: dims.h
+		};
+		state.villages.push({
+			x: rect.x, y: rect.y, w: rect.w, h: rect.h,
+			color: document.getElementById("vColor").value,
+			desc: ""
+		});
+		saveJSON(LS.villages, state.villages);
+		setStatus("Village placed manually. Click it to edit, or keep clicking to place more. Press 'Place manually' again to stop.");
+		draw();
+	}
+
+	// Zoom toward the cursor.
+	canvas.addEventListener("wheel", function (e) {
+		if (!state.W) return;
+		e.preventDefault();
+		var rect = canvas.getBoundingClientRect();
+		var sx = e.clientX - rect.left;
+		var sy = e.clientY - rect.top;
+		var gx = (sx - state.offsetX) / state.zoom;
+		var gy = (sy - state.offsetY) / state.zoom;
+		var factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+		state.zoom = Math.max(0.05, Math.min(40, state.zoom * factor));
+		state.offsetX = sx - gx * state.zoom;
+		state.offsetY = sy - gy * state.zoom;
+		draw();
+	}, { passive: false });
+
+	function zoomBy(factor) {
+		var cx = canvas.width / 2, cy = canvas.height / 2;
+		var gx = (cx - state.offsetX) / state.zoom;
+		var gy = (cy - state.offsetY) / state.zoom;
+		state.zoom = Math.max(0.05, Math.min(40, state.zoom * factor));
+		state.offsetX = cx - gx * state.zoom;
+		state.offsetY = cy - gy * state.zoom;
+		draw();
+	}
+
+	// ---- Controls ----
+	document.getElementById("mapFile").addEventListener("change", function (e) {
+		if (e.target.files[0]) handleFile(e.target.files[0], false);
+	});
+	document.getElementById("tierFile").addEventListener("change", function (e) {
+		if (e.target.files[0]) handleFile(e.target.files[0], true);
+	});
+
+	document.getElementById("viewBiome").addEventListener("click", function () {
+		state.view = "biome";
+		this.classList.add("active");
+		document.getElementById("viewTier").classList.remove("active");
+		draw();
+	});
+	document.getElementById("viewTier").addEventListener("click", function () {
+		state.view = "tier";
+		this.classList.add("active");
+		document.getElementById("viewBiome").classList.remove("active");
+		draw();
+	});
+
+	document.getElementById("zoomIn").addEventListener("click", function () { zoomBy(1.25); });
+	document.getElementById("zoomOut").addEventListener("click", function () { zoomBy(1 / 1.25); });
+	document.getElementById("zoomReset").addEventListener("click", function () { fitToViewport(); draw(); });
+
+	document.getElementById("placeRandom").addEventListener("click", placeRandomVillages);
+
+	document.getElementById("placeManual").addEventListener("click", function () {
+		state.placingManual = !state.placingManual;
+		this.classList.toggle("active", state.placingManual);
+		canvas.classList.toggle("placing", state.placingManual);
+		if (state.placingManual) {
+			hidePopup();
+			setStatus("Manual placement: hover over the map and click to place a village.");
+		} else {
+			state.hoverPx = null;
+			setStatus("Manual placement off.");
+			draw();
+		}
+	});
+
+	document.getElementById("clearVillages").addEventListener("click", function () {
+		if (confirm("Remove all placed villages?")) {
+			state.villages = [];
+			saveJSON(LS.villages, state.villages);
+			draw();
+		}
+	});
+
+	document.getElementById("clearAll").addEventListener("click", function () {
+		if (confirm("Clear all saved data (images, labels, villages, settings)?")) {
+			Object.keys(LS).forEach(function (k) { localStorage.removeItem(LS[k]); });
+			location.reload();
+		}
+	});
+
+	// Persist village settings.
+	function saveSettings() {
+		saveJSON(LS.settings, {
+			color: document.getElementById("vColor").value,
+			width: document.getElementById("vWidth").value,
+			height: document.getElementById("vHeight").value,
+			minDist: document.getElementById("vMinDist").value,
+			count: document.getElementById("vCount").value
+		});
+	}
+	["vColor", "vWidth", "vHeight", "vMinDist", "vCount"].forEach(function (id) {
+		document.getElementById(id).addEventListener("change", saveSettings);
+	});
+	document.getElementById("vRandomColor").addEventListener("click", function () {
+		document.getElementById("vColor").value = randomColor();
+		saveSettings();
+	});
+
+	// ---- Init ----
+	function init() {
+		resizeCanvas();
+
+		// Restore labels / villages / settings.
+		state.biomeLabels = loadJSON(LS.biomeLabels, {});
+		state.tierLabels = loadJSON(LS.tierLabels, {});
+		state.villages = loadJSON(LS.villages, []);
+
+		var settings = loadJSON(LS.settings, null);
+		if (settings) {
+			if (settings.color) document.getElementById("vColor").value = settings.color;
+			if (settings.width) document.getElementById("vWidth").value = settings.width;
+			if (settings.height) document.getElementById("vHeight").value = settings.height;
+			if (settings.minDist != null) document.getElementById("vMinDist").value = settings.minDist;
+			if (settings.count) document.getElementById("vCount").value = settings.count;
+		} else {
+			// Default to a random color, saved for next time.
+			document.getElementById("vColor").value = randomColor();
+			saveSettings();
+		}
+
+		// Restore saved images.
+		var mapSrc = localStorage.getItem(LS.mapImage);
+		var tierSrc = localStorage.getItem(LS.tierImage);
+		var chain = Promise.resolve();
+		if (mapSrc) {
+			chain = chain.then(function () {
+				return loadImageFromSrc(mapSrc).then(applyMapImage);
+			});
+		}
+		if (tierSrc) {
+			chain = chain.then(function () {
+				return loadImageFromSrc(tierSrc).then(applyTierImage);
+			});
+		}
+		chain.then(function () { draw(); });
+	}
+
+	window.addEventListener("resize", function () {
+		resizeCanvas();
+		if (!state.W) return;
+		draw();
+	});
+
+	init();
+	</script>
+</body>
+</html>
