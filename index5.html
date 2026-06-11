@@ -4,38 +4,6 @@
 	<meta charset="utf-8">
 	<title>Village Map</title>
 	<style>
-		.header {
-			background-color: black;
-			border: 2px solid blue;
-			color: white;
-			text-align: center;
-			padding: 10px;
-		}
-		.dropdown {
-			position: relative;
-			display: inline-block;
-		}
-		.dropdown-content {
-			display: none;
-			position: absolute;
-			background-color: #f9f9f9;
-			min-width: 160px;
-			box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
-			z-index: 1000;
-		}
-		.dropdown:hover .dropdown-content {
-			display: block;
-		}
-		.dropdown-content a {
-			color: black;
-			padding: 12px 16px;
-			text-decoration: none;
-			display: block;
-		}
-		.dropdown-content a:hover {
-			background-color: #f1f1f1;
-		}
-
 		body {
 			font-family: Arial, Helvetica, sans-serif;
 			margin: 0;
@@ -129,19 +97,6 @@
 	</style>
 </head>
 <body>
-	<div class="header">
-		<div class="dropdown">
-			<button class="dropbtn">Select a Game</button>
-			<div class="dropdown-content">
-				<a href="index.html">Maze</a>
-				<a href="index2.html">Unfair Pong</a>
-				<a href="index3.html">Dodging Rain</a>
-				<a href="index4.html">Catch a Rain Drop</a>
-				<a href="index5.html">Village Map</a>
-			</div>
-		</div>
-	</div>
-
 	<div class="wrap">
 		<h2>Village Map</h2>
 
@@ -219,13 +174,14 @@
 
 	// ---- Storage keys ----
 	var LS = {
-		mapImage: "villageMap.mapImage",
-		tierImage: "villageMap.tierImage",
 		biomeLabels: "villageMap.biomeLabels",
 		tierLabels: "villageMap.tierLabels",
 		villages: "villageMap.villages",
 		settings: "villageMap.settings"
 	};
+	// Legacy localStorage keys for images (migrated to IndexedDB).
+	var LEGACY_IMAGE_KEYS = ["villageMap.mapImage", "villageMap.tierImage"];
+	var IMG_KEY = { map: "map", tier: "tier" };
 
 	// ---- State ----
 	var state = {
@@ -275,6 +231,43 @@
 		try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
 	}
 
+	// Images can be large (a detailed 690x690 map exceeds the localStorage
+	// quota), so they are stored in IndexedDB instead. Values are data URLs.
+	var ImageDB = (function () {
+		var dbp = null;
+		function open() {
+			if (dbp) return dbp;
+			dbp = new Promise(function (resolve, reject) {
+				var req = indexedDB.open("villageMap", 1);
+				req.onupgradeneeded = function () {
+					req.result.createObjectStore("images");
+				};
+				req.onsuccess = function () { resolve(req.result); };
+				req.onerror = function () { reject(req.error); };
+			});
+			return dbp;
+		}
+		function tx(mode, fn) {
+			return open().then(function (db) {
+				return new Promise(function (resolve, reject) {
+					var t = db.transaction("images", mode);
+					var store = t.objectStore("images");
+					var result;
+					var rq = fn(store);
+					if (rq) rq.onsuccess = function () { result = rq.result; };
+					t.oncomplete = function () { resolve(result); };
+					t.onerror = function () { reject(t.error); };
+					t.onabort = function () { reject(t.error); };
+				});
+			});
+		}
+		return {
+			put: function (key, val) { return tx("readwrite", function (s) { return s.put(val, key); }); },
+			get: function (key) { return tx("readonly", function (s) { return s.get(key); }); },
+			del: function (key) { return tx("readwrite", function (s) { return s.delete(key); }); }
+		};
+	})();
+
 	// Build ImageData for an image at the grid (W x H) resolution.
 	function imageToData(img, w, h) {
 		var c = document.createElement("canvas");
@@ -285,15 +278,59 @@
 		return cc.getImageData(0, 0, w, h);
 	}
 
-	// Scan an ImageData for the full color palette (hex -> pixel count).
+	// Scan an ImageData for the palette of visible colors (hex -> pixel count).
+	// Fully/near transparent pixels are not visible, so they are excluded.
 	function scanPalette(data) {
 		var counts = {};
 		var d = data.data;
 		for (var i = 0; i < d.length; i += 4) {
+			if (d[i + 3] < 16) continue; // skip (near-)transparent pixels
 			var hex = toHex(d[i], d[i + 1], d[i + 2]);
 			counts[hex] = (counts[hex] || 0) + 1;
 		}
 		return counts;
+	}
+
+	// Order colors so similar shades are adjacent, using a greedy
+	// nearest-neighbor walk through RGB space. Makes it easier for a user
+	// to distinguish tones than a count-based sort.
+	function orderByNearestNeighbor(hexes) {
+		if (hexes.length <= 2) return hexes.slice();
+		var pts = hexes.map(function (hex) {
+			return {
+				hex: hex,
+				r: parseInt(hex.substr(1, 2), 16),
+				g: parseInt(hex.substr(3, 2), 16),
+				b: parseInt(hex.substr(5, 2), 16)
+			};
+		});
+		function dist2(a, b) {
+			var dr = a.r - b.r, dg = a.g - b.g, db = a.b - b.b;
+			return dr * dr + dg * dg + db * db;
+		}
+		// Start from the darkest color for a stable, repeatable ordering.
+		var startIdx = 0, startSum = Infinity;
+		for (var i = 0; i < pts.length; i++) {
+			var sum = pts[i].r + pts[i].g + pts[i].b;
+			if (sum < startSum) { startSum = sum; startIdx = i; }
+		}
+		var used = new Array(pts.length);
+		var order = [];
+		var current = startIdx;
+		used[current] = true;
+		order.push(pts[current].hex);
+		for (var n = 1; n < pts.length; n++) {
+			var best = -1, bestD = Infinity;
+			for (var j = 0; j < pts.length; j++) {
+				if (used[j]) continue;
+				var dd = dist2(pts[current], pts[j]);
+				if (dd < bestD) { bestD = dd; best = j; }
+			}
+			used[best] = true;
+			order.push(pts[best].hex);
+			current = best;
+		}
+		return order;
 	}
 
 	// Color at grid pixel (x,y) for given ImageData.
@@ -404,7 +441,7 @@
 	// ---- Palette UI ----
 	function renderPalette(listEl, counts, labels, key, countEl) {
 		listEl.innerHTML = "";
-		var hexes = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
+		var hexes = orderByNearestNeighbor(Object.keys(counts));
 		if (countEl) countEl.textContent = "(" + hexes.length + " colors)";
 		hexes.forEach(function (hex) {
 			var row = document.createElement("div");
@@ -494,10 +531,10 @@
 			var dataUrl = reader.result;
 			loadImageFromSrc(dataUrl).then(function (img) {
 				if (isTier) {
-					saveJSON(LS.tierImage, dataUrl);
+					ImageDB.put(IMG_KEY.tier, dataUrl);
 					applyTierImage(img);
 				} else {
-					saveJSON(LS.mapImage, dataUrl);
+					ImageDB.put(IMG_KEY.map, dataUrl);
 					applyMapImage(img);
 				}
 			});
@@ -814,7 +851,13 @@
 	document.getElementById("clearAll").addEventListener("click", function () {
 		if (confirm("Clear all saved data (images, labels, villages, settings)?")) {
 			Object.keys(LS).forEach(function (k) { localStorage.removeItem(LS[k]); });
-			location.reload();
+			LEGACY_IMAGE_KEYS.forEach(function (k) {
+				try { localStorage.removeItem(k); } catch (e) {}
+			});
+			Promise.all([
+				ImageDB.del(IMG_KEY.map),
+				ImageDB.del(IMG_KEY.tier)
+			]).then(function () { location.reload(); }, function () { location.reload(); });
 		}
 	});
 
@@ -858,21 +901,39 @@
 			saveSettings();
 		}
 
-		// Restore saved images.
-		var mapSrc = localStorage.getItem(LS.mapImage);
-		var tierSrc = localStorage.getItem(LS.tierImage);
-		var chain = Promise.resolve();
-		if (mapSrc) {
-			chain = chain.then(function () {
-				return loadImageFromSrc(mapSrc).then(applyMapImage);
+		// Restore saved images from IndexedDB, migrating any legacy
+		// localStorage-stored images on the way.
+		function loadStoredImage(idbKey, legacyKey) {
+			return ImageDB.get(idbKey).then(function (src) {
+				if (src) return src;
+				var legacy = null;
+				try { legacy = localStorage.getItem(legacyKey); } catch (e) {}
+				if (legacy) {
+					ImageDB.put(idbKey, legacy);
+					try { localStorage.removeItem(legacyKey); } catch (e2) {}
+				}
+				return legacy;
 			});
 		}
-		if (tierSrc) {
-			chain = chain.then(function () {
-				return loadImageFromSrc(tierSrc).then(applyTierImage);
-			});
-		}
-		chain.then(function () { draw(); });
+
+		Promise.all([
+			loadStoredImage(IMG_KEY.map, LEGACY_IMAGE_KEYS[0]),
+			loadStoredImage(IMG_KEY.tier, LEGACY_IMAGE_KEYS[1])
+		]).then(function (srcs) {
+			var mapSrc = srcs[0], tierSrc = srcs[1];
+			var chain = Promise.resolve();
+			if (mapSrc) {
+				chain = chain.then(function () {
+					return loadImageFromSrc(mapSrc).then(applyMapImage);
+				});
+			}
+			if (tierSrc) {
+				chain = chain.then(function () {
+					return loadImageFromSrc(tierSrc).then(applyTierImage);
+				});
+			}
+			return chain;
+		}).then(function () { draw(); });
 	}
 
 	window.addEventListener("resize", function () {
