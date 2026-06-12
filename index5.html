@@ -144,11 +144,26 @@
 				<button id="placeManual">Place manually</button>
 			</div>
 			<div class="group">
+				<label>Guild
+					<select id="guildSelect"><option value="">(no guild)</option></select>
+				</label>
+				<input type="text" id="guildName" placeholder="new guild name">
+				<input type="color" id="guildColor">
+				<button id="guildRandomColor" title="Pick a new random color">&#127922;</button>
+				<button id="addGuild">Add guild</button>
+			</div>
+			<div class="group">
 				<button id="clearVillages">Remove all villages</button>
 			</div>
 		</div>
 
 		<div class="status" id="status">Load a 690x690 map image to begin.</div>
+
+		<div class="muted" style="margin-bottom:8px;">
+			Manual placement: left-click to place a town. A town touching an existing
+			town merges into it (odd shapes allowed). Right-click erases the squares it
+			overlaps; a town with no squares left is removed.
+		</div>
 
 		<div id="mapViewport">
 			<canvas id="mapCanvas"></canvas>
@@ -166,6 +181,11 @@
 				<div class="muted">Label each tier color. Villages may only be placed on tiers whose name contains 1, 2 or 3.</div>
 				<div class="list" id="tierList"></div>
 			</div>
+			<div class="palette">
+				<h3>Guilds <span class="muted" id="guildCount"></span></h3>
+				<div class="muted">Towns assigned to a guild are drawn in the guild color. Add a guild above, then select it before placing or spawning towns.</div>
+				<div class="list" id="guildList"></div>
+			</div>
 		</div>
 	</div>
 
@@ -177,6 +197,7 @@
 		biomeLabels: "villageMap.biomeLabels",
 		tierLabels: "villageMap.tierLabels",
 		villages: "villageMap.villages",
+		guilds: "villageMap.guilds",
 		settings: "villageMap.settings"
 	};
 	// Legacy localStorage keys for images (migrated to IndexedDB).
@@ -190,7 +211,8 @@
 		mapData: null, tierData: null, // ImageData for pixel reads
 		biomeLabels: {},            // hex -> name
 		tierLabels: {},             // hex -> name
-		villages: [],               // {x,y,w,h,color,desc}
+		villages: [],               // {cells:[[x,y],...], color, desc, guild}
+		guilds: [],                 // {name, color}
 		view: "biome",
 		zoom: 1, offsetX: 0, offsetY: 0,
 		placingManual: false,
@@ -357,6 +379,81 @@
 		return /water/i.test(name || "");
 	}
 
+	// ---- Village cell model ----
+	// A village is a set of unit cells: { cells: [[x,y],...], color, desc, guild }.
+	// This allows odd shapes formed by merging touching towns and by erasing.
+	function cellKey(x, y) { return x + "," + y; }
+
+	function villageCellSet(v) {
+		var set = {};
+		for (var i = 0; i < v.cells.length; i++) {
+			set[cellKey(v.cells[i][0], v.cells[i][1])] = true;
+		}
+		return set;
+	}
+
+	// Cells of a w x h block centred on a grid point, clipped to the map.
+	function brushCells(gridPt, w, h) {
+		var x0 = gridPt.x - Math.floor(w / 2);
+		var y0 = gridPt.y - Math.floor(h / 2);
+		var out = [];
+		for (var dy = 0; dy < h; dy++) {
+			for (var dx = 0; dx < w; dx++) {
+				var x = x0 + dx, y = y0 + dy;
+				if (x >= 0 && y >= 0 && x < state.W && y < state.H) out.push([x, y]);
+			}
+		}
+		return out;
+	}
+
+	// Bounding rectangle of a village's cells (for distance checks).
+	function villageBounds(v) {
+		var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+		for (var i = 0; i < v.cells.length; i++) {
+			var x = v.cells[i][0], y = v.cells[i][1];
+			if (x < minX) minX = x;
+			if (y < minY) minY = y;
+			if (x > maxX) maxX = x;
+			if (y > maxY) maxY = y;
+		}
+		return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+	}
+
+	// Resolve the color a village is drawn with: guild color if it belongs to a
+	// guild that still exists, otherwise its own color.
+	function guildByName(name) {
+		for (var i = 0; i < state.guilds.length; i++) {
+			if (state.guilds[i].name === name) return state.guilds[i];
+		}
+		return null;
+	}
+	function villageColor(v) {
+		if (v.guild) {
+			var g = guildByName(v.guild);
+			if (g) return g.color;
+		}
+		return v.color;
+	}
+
+	// Convert any legacy rectangle villages ({x,y,w,h}) to the cell model and
+	// ensure newer fields exist. Idempotent for already-migrated data.
+	function migrateVillages(list) {
+		if (!Array.isArray(list)) return [];
+		return list.map(function (v) {
+			if (v && Array.isArray(v.cells)) {
+				if (v.guild === undefined) v.guild = null;
+				return v;
+			}
+			var cells = [];
+			if (v && typeof v.x === "number") {
+				for (var y = v.y; y < v.y + (v.h || 1); y++) {
+					for (var x = v.x; x < v.x + (v.w || 1); x++) cells.push([x, y]);
+				}
+			}
+			return { cells: cells, color: (v && v.color) || "#ff0000", desc: (v && v.desc) || "", guild: null };
+		}).filter(function (v) { return v.cells.length > 0; });
+	}
+
 	// ---- Rendering ----
 	function currentImg() {
 		return state.view === "tier" ? state.tierImg : state.mapImg;
@@ -382,26 +479,36 @@
 		ctx.imageSmoothingEnabled = false;
 		ctx.drawImage(img, state.offsetX, state.offsetY, state.W * state.zoom, state.H * state.zoom);
 
-		// Villages
+		// Villages (cell-based; odd shapes supported)
 		for (var i = 0; i < state.villages.length; i++) {
 			var v = state.villages[i];
-			ctx.fillStyle = v.color;
+			var set = villageCellSet(v);
+			var z = state.zoom;
+			// Fill each cell.
+			ctx.fillStyle = villageColor(v);
 			ctx.globalAlpha = 0.85;
-			ctx.fillRect(
-				state.offsetX + v.x * state.zoom,
-				state.offsetY + v.y * state.zoom,
-				v.w * state.zoom,
-				v.h * state.zoom
-			);
+			for (var ci = 0; ci < v.cells.length; ci++) {
+				var cx = v.cells[ci][0], cy = v.cells[ci][1];
+				ctx.fillRect(
+					state.offsetX + cx * z,
+					state.offsetY + cy * z,
+					z, z
+				);
+			}
 			ctx.globalAlpha = 1;
+			// Outline only the outer boundary edges (edges with no neighbor cell).
 			ctx.strokeStyle = "rgba(0,0,0,0.6)";
 			ctx.lineWidth = 1;
-			ctx.strokeRect(
-				state.offsetX + v.x * state.zoom,
-				state.offsetY + v.y * state.zoom,
-				v.w * state.zoom,
-				v.h * state.zoom
-			);
+			ctx.beginPath();
+			for (var cj = 0; cj < v.cells.length; cj++) {
+				var x = v.cells[cj][0], y = v.cells[cj][1];
+				var px = state.offsetX + x * z, py = state.offsetY + y * z;
+				if (!set[cellKey(x, y - 1)]) { ctx.moveTo(px, py); ctx.lineTo(px + z, py); }
+				if (!set[cellKey(x, y + 1)]) { ctx.moveTo(px, py + z); ctx.lineTo(px + z, py + z); }
+				if (!set[cellKey(x - 1, y)]) { ctx.moveTo(px, py); ctx.lineTo(px, py + z); }
+				if (!set[cellKey(x + 1, y)]) { ctx.moveTo(px + z, py); ctx.lineTo(px + z, py + z); }
+			}
+			ctx.stroke();
 		}
 
 		// While placing manually, show each village's minimum-distance circle
@@ -414,10 +521,11 @@
 			if (minDist > 0) {
 				for (var c = 0; c < state.villages.length; c++) {
 					var vc = state.villages[c];
-					var gridRadius = minDist + Math.max(vc.w, vc.h) / 2;
+					var b = villageBounds(vc);
+					var gridRadius = minDist + Math.max(b.w, b.h) / 2;
 					var screenRadius = gridRadius * state.zoom;
-					var cx = state.offsetX + (vc.x + vc.w / 2) * state.zoom;
-					var cy = state.offsetY + (vc.y + vc.h / 2) * state.zoom;
+					var cx = state.offsetX + (b.x + b.w / 2) * state.zoom;
+					var cy = state.offsetY + (b.y + b.h / 2) * state.zoom;
 					ctx.beginPath();
 					ctx.arc(cx, cy, screenRadius, 0, Math.PI * 2);
 					ctx.fillStyle = "rgba(255,80,80,0.12)";
@@ -515,6 +623,92 @@
 		);
 	}
 
+	// ---- Guilds ----
+	function saveGuilds() { saveJSON(LS.guilds, state.guilds); }
+
+	// Keep the active-guild dropdown in sync with the guild list.
+	function refreshGuildSelect() {
+		var sel = document.getElementById("guildSelect");
+		var prev = sel.value;
+		sel.innerHTML = '<option value="">(no guild)</option>';
+		state.guilds.forEach(function (g) {
+			var opt = document.createElement("option");
+			opt.value = g.name;
+			opt.textContent = g.name;
+			sel.appendChild(opt);
+		});
+		// Restore previous selection if it still exists.
+		sel.value = guildByName(prev) ? prev : "";
+	}
+
+	// Render the guild color list, mirroring the biome/tier palettes.
+	function renderGuilds() {
+		var listEl = document.getElementById("guildList");
+		var countEl = document.getElementById("guildCount");
+		listEl.innerHTML = "";
+		if (countEl) countEl.textContent = "(" + state.guilds.length + ")";
+		state.guilds.forEach(function (g, idx) {
+			var row = document.createElement("div");
+			row.className = "swatchRow";
+
+			var sw = document.createElement("div");
+			sw.className = "swatch";
+			sw.style.background = g.color;
+
+			var name = document.createElement("span");
+			name.style.flex = "1 1 auto";
+			name.textContent = g.name;
+
+			var colorInp = document.createElement("input");
+			colorInp.type = "color";
+			colorInp.value = g.color;
+			colorInp.style.flex = "0 0 auto";
+			colorInp.addEventListener("input", function () {
+				g.color = colorInp.value;
+				sw.style.background = g.color;
+				saveGuilds();
+				draw(); // member towns follow the guild color
+			});
+
+			var del = document.createElement("button");
+			del.textContent = "\u2715";
+			del.title = "Delete guild";
+			del.addEventListener("click", function () {
+				var removed = state.guilds.splice(idx, 1)[0];
+				// Detach member towns so they fall back to their own color.
+				state.villages.forEach(function (v) {
+					if (v.guild === removed.name) v.guild = null;
+				});
+				saveGuilds();
+				saveJSON(LS.villages, state.villages);
+				refreshGuildSelect();
+				renderGuilds();
+				draw();
+			});
+
+			row.appendChild(sw);
+			row.appendChild(name);
+			row.appendChild(colorInp);
+			row.appendChild(del);
+			listEl.appendChild(row);
+		});
+	}
+
+	function addGuild() {
+		var nameEl = document.getElementById("guildName");
+		var name = nameEl.value.trim();
+		if (!name) { setStatus("Enter a guild name first."); return; }
+		if (guildByName(name)) { setStatus("A guild named '" + name + "' already exists."); return; }
+		var color = document.getElementById("guildColor").value;
+		state.guilds.push({ name: name, color: color });
+		saveGuilds();
+		nameEl.value = "";
+		document.getElementById("guildColor").value = randomColor(); // ready for the next one
+		refreshGuildSelect();
+		document.getElementById("guildSelect").value = name; // make it the active guild
+		renderGuilds();
+		setStatus("Guild '" + name + "' added. Placed and spawned towns will join it.");
+	}
 	// ---- Image loading ----
 	function loadImageFromSrc(src) {
 		return new Promise(function (resolve, reject) {
@@ -598,7 +792,7 @@
 		}
 		// Respect minimum distance from existing villages.
 		for (var i = 0; i < state.villages.length; i++) {
-			if (rectSeparation(rect, state.villages[i]) < minDist) return false;
+			if (rectSeparation(rect, villageBounds(state.villages[i])) < minDist) return false;
 		}
 		return true;
 	}
@@ -612,6 +806,7 @@
 		var minDist = Math.max(0, parseInt(document.getElementById("vMinDist").value, 10) || 0);
 		var color = document.getElementById("vColor").value;
 		var count = Math.max(1, parseInt(document.getElementById("vCount").value, 10) || 1);
+		var guild = document.getElementById("guildSelect").value || null;
 
 		var placed = 0, failures = 0;
 		for (var n = 0; n < count; n++) {
@@ -623,9 +818,12 @@
 					w: dims.w, h: dims.h
 				};
 				if (isValidSpot(rect, minDist)) {
+					var cells = [];
+					for (var ry = rect.y; ry < rect.y + rect.h; ry++) {
+						for (var rx = rect.x; rx < rect.x + rect.w; rx++) cells.push([rx, ry]);
+					}
 					state.villages.push({
-						x: rect.x, y: rect.y, w: rect.w, h: rect.h,
-						color: color, desc: ""
+						cells: cells, color: color, desc: "", guild: guild
 					});
 					placed++;
 					ok = true;
@@ -680,11 +878,20 @@
 
 	function showVillagePopup(index, clientX, clientY) {
 		var v = state.villages[index];
+		var b = villageBounds(v);
+		var guildOptions = '<option value="">(no guild)</option>';
+		for (var gi = 0; gi < state.guilds.length; gi++) {
+			var gn = state.guilds[gi].name;
+			guildOptions += '<option value="' + escapeHtml(gn) + '"' +
+				(v.guild === gn ? ' selected' : '') + '>' + escapeHtml(gn) + '</option>';
+		}
 		popup.innerHTML =
 			'<span class="close" id="popClose">&times;</span>' +
-			'<div><strong>Village</strong> (' + v.x + ', ' + v.y + ')</div>' +
+			'<div><strong>Town</strong> (' + b.x + ', ' + b.y + ') · ' + v.cells.length + ' sq</div>' +
 			'<label for="vDesc">Description</label>' +
 			'<textarea id="vDesc" placeholder="guilds, special buildings...">' + escapeHtml(v.desc || "") + '</textarea>' +
+			'<label for="vGuild">Guild</label>' +
+			'<select id="vGuild">' + guildOptions + '</select>' +
 			'<div class="row"><label for="vEditColor">Color</label>' +
 			'<input type="color" id="vEditColor" value="' + v.color + '"></div>' +
 			'<div class="row">' +
@@ -696,6 +903,7 @@
 		document.getElementById("vSave").onclick = function () {
 			v.desc = document.getElementById("vDesc").value;
 			v.color = document.getElementById("vEditColor").value;
+			v.guild = document.getElementById("vGuild").value || null;
 			saveJSON(LS.villages, state.villages);
 			draw();
 			hidePopup();
@@ -715,13 +923,10 @@
 	}
 
 	function villageAt(gridPt) {
+		var key = cellKey(gridPt.x, gridPt.y);
 		// Topmost village wins (iterate in reverse draw order).
 		for (var i = state.villages.length - 1; i >= 0; i--) {
-			var v = state.villages[i];
-			if (gridPt.x >= v.x && gridPt.x < v.x + v.w &&
-				gridPt.y >= v.y && gridPt.y < v.y + v.h) {
-				return i;
-			}
+			if (villageCellSet(state.villages[i])[key]) return i;
 		}
 		return -1;
 	}
@@ -765,7 +970,7 @@
 		var gridPt = screenToGrid(e.clientX, e.clientY);
 
 		if (state.placingManual) {
-			placeManualAt(gridPt);
+			if (e.button === 0) placeManualAt(gridPt); // erase handled via contextmenu
 			return;
 		}
 		if (dragMoved) return; // it was a pan, not a click
@@ -781,21 +986,110 @@
 		}
 	});
 
+	// Right-click erases town squares while in manual placement mode.
+	canvas.addEventListener("contextmenu", function (e) {
+		if (!state.placingManual || !state.W) return;
+		e.preventDefault();
+		dragging = false;
+		canvas.classList.remove("grabbing");
+		eraseManualAt(screenToGrid(e.clientX, e.clientY));
+	});
+
 	function placeManualAt(gridPt) {
 		var dims = getVillageDims();
-		var rect = {
-			x: gridPt.x - Math.floor(dims.w / 2),
-			y: gridPt.y - Math.floor(dims.h / 2),
-			w: dims.w, h: dims.h
-		};
-		state.villages.push({
-			x: rect.x, y: rect.y, w: rect.w, h: rect.h,
-			color: document.getElementById("vColor").value,
-			desc: ""
-		});
+		var newCells = brushCells(gridPt, dims.w, dims.h);
+		if (newCells.length === 0) return;
+
+		// Mark the cells being placed for fast adjacency/overlap tests.
+		var newSet = {};
+		for (var i = 0; i < newCells.length; i++) {
+			newSet[cellKey(newCells[i][0], newCells[i][1])] = true;
+		}
+
+		// A town "touches" the new block when one of its cells overlaps or is
+		// edge-adjacent (4-neighbour) to a new cell.
+		function touches(v) {
+			for (var j = 0; j < v.cells.length; j++) {
+				var x = v.cells[j][0], y = v.cells[j][1];
+				if (newSet[cellKey(x, y)] ||
+					newSet[cellKey(x - 1, y)] || newSet[cellKey(x + 1, y)] ||
+					newSet[cellKey(x, y - 1)] || newSet[cellKey(x, y + 1)]) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		var touched = [];
+		for (var t = 0; t < state.villages.length; t++) {
+			if (touches(state.villages[t])) touched.push(t);
+		}
+
+		var guild = document.getElementById("guildSelect").value || null;
+
+		if (touched.length === 0) {
+			// Standalone new town.
+			state.villages.push({
+				cells: newCells,
+				color: document.getElementById("vColor").value,
+				desc: "",
+				guild: guild
+			});
+		} else {
+			// Merge into the first touched town, absorbing any others, so the
+			// result is a single expanding unit (odd shapes allowed).
+			var target = state.villages[touched[0]];
+			var merged = villageCellSet(target);
+			function absorb(cells) {
+				for (var k = 0; k < cells.length; k++) {
+					var key = cellKey(cells[k][0], cells[k][1]);
+					if (!merged[key]) { merged[key] = true; target.cells.push(cells[k]); }
+				}
+			}
+			// Absorb other touched towns (iterate high->low to splice safely).
+			for (var m = touched.length - 1; m >= 1; m--) {
+				absorb(state.villages[touched[m]].cells);
+				state.villages.splice(touched[m], 1);
+			}
+			absorb(newCells);
+		}
+
 		saveJSON(LS.villages, state.villages);
-		setStatus("Village placed manually. Click it to edit, or keep clicking to place more. Press 'Place manually' again to stop.");
+		setStatus("Town placed. Touching towns merge into one. Right-click to erase squares. Press 'Place manually' again to stop.");
 		draw();
+	}
+
+	// Right-click while placing manually erases the squares of any town that the
+	// brush overlaps. A town left with no squares is removed (no ghost town).
+	function eraseManualAt(gridPt) {
+		var dims = getVillageDims();
+		var eraseCells = brushCells(gridPt, dims.w, dims.h);
+		var eraseSet = {};
+		for (var i = 0; i < eraseCells.length; i++) {
+			eraseSet[cellKey(eraseCells[i][0], eraseCells[i][1])] = true;
+		}
+		var changed = false;
+		for (var v = state.villages.length - 1; v >= 0; v--) {
+			var vil = state.villages[v];
+			var kept = [];
+			for (var c = 0; c < vil.cells.length; c++) {
+				if (eraseSet[cellKey(vil.cells[c][0], vil.cells[c][1])]) {
+					changed = true;
+				} else {
+					kept.push(vil.cells[c]);
+				}
+			}
+			if (kept.length === 0) {
+				state.villages.splice(v, 1); // last squares removed: delete the town
+			} else {
+				vil.cells = kept;
+			}
+		}
+		if (changed) {
+			saveJSON(LS.villages, state.villages);
+			setStatus("Erased town squares. Empty towns were removed.");
+			draw();
+		}
 	}
 
 	// Zoom toward the cursor.
@@ -905,14 +1199,27 @@
 		saveSettings();
 	});
 
+	// Guild controls.
+	document.getElementById("addGuild").addEventListener("click", addGuild);
+	document.getElementById("guildName").addEventListener("keydown", function (e) {
+		if (e.key === "Enter") addGuild();
+	});
+	document.getElementById("guildRandomColor").addEventListener("click", function () {
+		document.getElementById("guildColor").value = randomColor();
+	});
+
 	// ---- Init ----
 	function init() {
 		resizeCanvas();
 
-		// Restore labels / villages / settings.
+		// Restore labels / villages / guilds / settings.
 		state.biomeLabels = loadJSON(LS.biomeLabels, {});
 		state.tierLabels = loadJSON(LS.tierLabels, {});
-		state.villages = loadJSON(LS.villages, []);
+		state.villages = migrateVillages(loadJSON(LS.villages, []));
+		state.guilds = loadJSON(LS.guilds, []);
+		document.getElementById("guildColor").value = randomColor();
+		refreshGuildSelect();
+		renderGuilds();
 
 		var settings = loadJSON(LS.settings, null);
 		if (settings) {
