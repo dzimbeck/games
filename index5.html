@@ -54,6 +54,7 @@
 		}
 		#mapCanvas { position: absolute; left: 0; top: 0; image-rendering: pixelated; }
 		#mapCanvas.placing { cursor: crosshair; }
+		#mapCanvas.measuring { cursor: crosshair; }
 		#mapCanvas.grabbing { cursor: grabbing; }
 
 		/* Soft popup */
@@ -115,6 +116,9 @@
 				<button id="zoomOut">&minus;</button>
 				<button id="zoomIn">+</button>
 				<button id="zoomReset">Fit</button>
+			</div>
+			<div class="group">
+				<button id="measure" title="Measure distance: left-click to add points, right-click to clear">Measure</button>
 			</div>
 			<div class="group">
 				<button id="saveJson" title="Download all saved data as a JSON file">Save to JSON</button>
@@ -223,7 +227,10 @@
 		zoom: 1, offsetX: 0, offsetY: 0,
 		placingManual: false,
 		hoverPx: null,              // {x,y} grid pixel under cursor while placing
-		highlightGuild: null        // guild name whose towns are circled, or null
+		highlightGuild: null,       // guild name whose towns are circled, or null
+		measuring: false,           // distance measurement mode active
+		measurePoints: [],          // [{x,y},...] polyline vertices in grid units (1 unit = 20 m)
+		measureHover: null          // {x,y} grid point under cursor while measuring
 	};
 
 	var viewport = document.getElementById("mapViewport");
@@ -233,6 +240,14 @@
 	var statusEl = document.getElementById("status");
 
 	function setStatus(msg) { statusEl.textContent = msg; }
+
+	// ---- Measurement constants ----
+	// Each grid pixel on the map represents 20 meters on the ground. Travel
+	// times are expressed per pixel: walking takes 8 s/pixel and running 2.5
+	// s/pixel.
+	var METERS_PER_PIXEL = 20;
+	var WALK_SEC_PER_PIXEL = 8;
+	var RUN_SEC_PER_PIXEL = 2.5;
 
 	// ---- Helpers ----
 	function toHex(r, g, b) {
@@ -583,6 +598,39 @@
 				dims.h * state.zoom
 			);
 		}
+
+		// Measurement polyline
+		drawMeasure();
+	}
+
+	// Draw the in-progress measurement line, its vertices, and a rubber-band
+	// segment from the last vertex to the cursor.
+	function drawMeasure() {
+		if (!state.measuring || state.measurePoints.length === 0) return;
+		var z = state.zoom;
+		function sx(p) { return state.offsetX + p.x * z; }
+		function sy(p) { return state.offsetY + p.y * z; }
+
+		var pts = state.measurePoints;
+		ctx.lineWidth = 2;
+		ctx.strokeStyle = "#ffeb3b";
+		ctx.beginPath();
+		ctx.moveTo(sx(pts[0]), sy(pts[0]));
+		for (var i = 1; i < pts.length; i++) ctx.lineTo(sx(pts[i]), sy(pts[i]));
+		// Rubber-band to the cursor so the next segment is previewed live.
+		if (state.measureHover) ctx.lineTo(sx(state.measureHover), sy(state.measureHover));
+		ctx.stroke();
+
+		// Vertices.
+		for (var j = 0; j < pts.length; j++) {
+			ctx.beginPath();
+			ctx.arc(sx(pts[j]), sy(pts[j]), 4, 0, Math.PI * 2);
+			ctx.fillStyle = "#ffeb3b";
+			ctx.fill();
+			ctx.lineWidth = 1.5;
+			ctx.strokeStyle = "#000";
+			ctx.stroke();
+		}
 	}
 
 	// ---- Coordinate mapping ----
@@ -593,6 +641,16 @@
 		return {
 			x: Math.floor((sx - state.offsetX) / state.zoom),
 			y: Math.floor((sy - state.offsetY) / state.zoom)
+		};
+	}
+
+	// Like screenToGrid but keeps sub-pixel precision, used by the measuring
+	// tool so distances are accurate regardless of zoom level.
+	function screenToGridF(clientX, clientY) {
+		var rect = canvas.getBoundingClientRect();
+		return {
+			x: (clientX - rect.left - state.offsetX) / state.zoom,
+			y: (clientY - rect.top - state.offsetY) / state.zoom
 		};
 	}
 
@@ -980,6 +1038,62 @@
 		});
 	}
 
+	// ---- Measurement ----
+	// Total polyline length in grid pixels. When "extra" is given (the live
+	// cursor position) it is appended so the popup previews the next segment.
+	function measureLength(extra) {
+		var pts = state.measurePoints;
+		if (extra) pts = pts.concat([extra]);
+		var len = 0;
+		for (var i = 1; i < pts.length; i++) {
+			var dx = pts[i].x - pts[i - 1].x;
+			var dy = pts[i].y - pts[i - 1].y;
+			len += Math.sqrt(dx * dx + dy * dy);
+		}
+		return len;
+	}
+
+	// Format a number of seconds as "1h 2m 3s" (hours/minutes omitted when 0).
+	function formatDuration(sec) {
+		sec = Math.max(0, Math.round(sec));
+		var h = Math.floor(sec / 3600);
+		var m = Math.floor((sec % 3600) / 60);
+		var s = sec % 60;
+		var parts = [];
+		if (h) parts.push(h + "h");
+		if (h || m) parts.push(m + "m");
+		parts.push(s + "s");
+		return parts.join(" ");
+	}
+
+	function measurePopupHtml() {
+		var lenPx = measureLength(state.measureHover);
+		var meters = lenPx * METERS_PER_PIXEL;
+		var distStr = meters >= 1000
+			? (meters / 1000).toFixed(2) + " km (" + Math.round(meters) + " m)"
+			: Math.round(meters) + " m";
+		return '<span class="close" id="popClose">&times;</span>' +
+			'<div><strong>Measurement</strong></div>' +
+			'<div><strong>Distance:</strong> ' + distStr + '</div>' +
+			'<div><strong>Walking:</strong> ' + formatDuration(lenPx * WALK_SEC_PER_PIXEL) + '</div>' +
+			'<div><strong>Running:</strong> ' + formatDuration(lenPx * RUN_SEC_PER_PIXEL) + '</div>' +
+			'<div class="muted">' + state.measurePoints.length + ' point(s) · right-click to clear</div>';
+	}
+
+	function showMeasurePopup(clientX, clientY) {
+		popup.innerHTML = measurePopupHtml();
+		positionPopup(clientX, clientY);
+		popup.classList.add("show");
+		document.getElementById("popClose").onclick = hidePopup;
+	}
+
+	// Refresh just the popup contents (keeping its position) as the cursor moves.
+	function updateMeasurePopup() {
+		if (!popup.classList.contains("show")) return;
+		popup.innerHTML = measurePopupHtml();
+		document.getElementById("popClose").onclick = hidePopup;
+	}
+
 	function villageAt(gridPt) {
 		var key = cellKey(gridPt.x, gridPt.y);
 		// Topmost village wins (iterate in reverse draw order).
@@ -1017,6 +1131,10 @@
 		if (state.placingManual && state.W) {
 			state.hoverPx = screenToGrid(e.clientX, e.clientY);
 			draw();
+		} else if (state.measuring && state.W) {
+			state.measureHover = screenToGridF(e.clientX, e.clientY);
+			if (state.measurePoints.length) updateMeasurePopup();
+			draw();
 		}
 	});
 
@@ -1029,6 +1147,17 @@
 
 		if (state.placingManual) {
 			if (e.button === 0) placeManualAt(gridPt); // erase handled via contextmenu
+			return;
+		}
+
+		if (state.measuring) {
+			if (e.button !== 0) return;     // right-click clears (handled below)
+			if (dragMoved) return;          // it was a pan, not a click
+			var mp = screenToGridF(e.clientX, e.clientY);
+			state.measurePoints.push(mp);
+			state.measureHover = mp;
+			showMeasurePopup(e.clientX, e.clientY);
+			draw();
 			return;
 		}
 		if (dragMoved) return; // it was a pan, not a click
@@ -1044,9 +1173,21 @@
 		}
 	});
 
-	// Right-click erases town squares while in manual placement mode.
+	// Right-click erases town squares while placing, or clears the measure line.
 	canvas.addEventListener("contextmenu", function (e) {
-		if (!state.placingManual || !state.W) return;
+		if (!state.W) return;
+		if (state.measuring) {
+			e.preventDefault();
+			dragging = false;
+			canvas.classList.remove("grabbing");
+			state.measurePoints = [];
+			state.measureHover = null;
+			hidePopup();
+			setStatus("Measurement cleared. Left-click on the map to start a new line.");
+			draw();
+			return;
+		}
+		if (!state.placingManual) return;
 		e.preventDefault();
 		dragging = false;
 		canvas.classList.remove("grabbing");
@@ -1208,6 +1349,7 @@
 		this.classList.toggle("active", state.placingManual);
 		canvas.classList.toggle("placing", state.placingManual);
 		if (state.placingManual) {
+			disableMeasuring();
 			hidePopup();
 			setStatus("Manual placement: hover over the map and click to place a village.");
 			draw();
@@ -1216,6 +1358,42 @@
 			setStatus("Manual placement off.");
 			draw();
 		}
+	});
+
+	// Turn the measuring tool off and reset its state (used when another mode
+	// takes over, e.g. manual placement).
+	function disableMeasuring() {
+		if (!state.measuring) return;
+		state.measuring = false;
+		state.measurePoints = [];
+		state.measureHover = null;
+		document.getElementById("measure").classList.remove("active");
+		canvas.classList.remove("measuring");
+	}
+
+	document.getElementById("measure").addEventListener("click", function () {
+		state.measuring = !state.measuring;
+		this.classList.toggle("active", state.measuring);
+		canvas.classList.toggle("measuring", state.measuring);
+		if (state.measuring) {
+			// Manual placement and measuring are mutually exclusive modes.
+			if (state.placingManual) {
+				state.placingManual = false;
+				state.hoverPx = null;
+				document.getElementById("placeManual").classList.remove("active");
+				canvas.classList.remove("placing");
+			}
+			state.measurePoints = [];
+			state.measureHover = null;
+			hidePopup();
+			setStatus("Measure: left-click to add points along a path, right-click to clear. 1 pixel = 20 m.");
+		} else {
+			state.measurePoints = [];
+			state.measureHover = null;
+			hidePopup();
+			setStatus("Measurement off.");
+		}
+		draw();
 	});
 
 	document.getElementById("clearVillages").addEventListener("click", function () {
