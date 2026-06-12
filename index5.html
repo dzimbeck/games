@@ -405,14 +405,17 @@
 		}
 
 		// While placing manually, show each village's minimum-distance circle
-		// (diameter = the configured minimum distance) so the user can see how
-		// close they are getting. Placement inside a circle is still allowed.
+		// so the user can see how close they are getting. The radius is the
+		// configured minimum distance plus half the village's larger dimension
+		// (e.g. a 6x6 village with minDist 20 gives radius 20 + 3 = 23).
+		// Placement inside a circle is still allowed.
 		if (state.placingManual) {
 			var minDist = Math.max(0, parseInt(document.getElementById("vMinDist").value, 10) || 0);
 			if (minDist > 0) {
-				var screenRadius = (minDist / 2) * state.zoom;
 				for (var c = 0; c < state.villages.length; c++) {
 					var vc = state.villages[c];
+					var gridRadius = minDist + Math.max(vc.w, vc.h) / 2;
+					var screenRadius = gridRadius * state.zoom;
 					var cx = state.offsetX + (vc.x + vc.w / 2) * state.zoom;
 					var cy = state.offsetY + (vc.y + vc.h / 2) * state.zoom;
 					ctx.beginPath();
