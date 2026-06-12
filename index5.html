@@ -151,6 +151,7 @@
 				<input type="color" id="guildColor">
 				<button id="guildRandomColor" title="Pick a new random color">&#127922;</button>
 				<button id="addGuild">Add guild</button>
+				<button id="removeGuild">Remove guild</button>
 			</div>
 			<div class="group">
 				<button id="clearVillages">Remove all villages</button>
@@ -216,7 +217,8 @@
 		view: "biome",
 		zoom: 1, offsetX: 0, offsetY: 0,
 		placingManual: false,
-		hoverPx: null               // {x,y} grid pixel under cursor while placing
+		hoverPx: null,              // {x,y} grid pixel under cursor while placing
+		highlightGuild: null        // guild name whose towns are circled, or null
 	};
 
 	var viewport = document.getElementById("mapViewport");
@@ -511,7 +513,25 @@
 			ctx.stroke();
 		}
 
-		// While placing manually, show each village's minimum-distance circle
+		// Highlight: when a guild is selected in the bottom list, ring all of its
+		// towns with a circle in the guild color so they are easy to spot.
+		if (state.highlightGuild) {
+			var hg = guildByName(state.highlightGuild);
+			var ringColor = (hg && hg.color) || "#ffcc00";
+			for (var hi = 0; hi < state.villages.length; hi++) {
+				var hv = state.villages[hi];
+				if (hv.guild !== state.highlightGuild) continue;
+				var hb = villageBounds(hv);
+				var hRadius = (Math.max(hb.w, hb.h) / 2 + 4) * state.zoom;
+				var hcx = state.offsetX + (hb.x + hb.w / 2) * state.zoom;
+				var hcy = state.offsetY + (hb.y + hb.h / 2) * state.zoom;
+				ctx.beginPath();
+				ctx.arc(hcx, hcy, hRadius, 0, Math.PI * 2);
+				ctx.strokeStyle = ringColor;
+				ctx.lineWidth = 2;
+				ctx.stroke();
+			}
+		}
 		// so the user can see how close they are getting. The radius is the
 		// configured minimum distance plus half the village's larger dimension
 		// (e.g. a 6x6 village with minDist 20 gives radius 20 + 3 = 23).
@@ -650,6 +670,19 @@
 		state.guilds.forEach(function (g, idx) {
 			var row = document.createElement("div");
 			row.className = "swatchRow";
+			row.style.cursor = "pointer";
+			if (state.highlightGuild === g.name) {
+				row.style.background = "#1d2433";
+				row.style.borderRadius = "4px";
+			}
+			row.title = "Click to circle this guild's towns";
+			// Click the row (but not its controls) to toggle highlighting this
+			// guild's towns on the map with circles.
+			row.addEventListener("click", function () {
+				state.highlightGuild = (state.highlightGuild === g.name) ? null : g.name;
+				renderGuilds();
+				draw();
+			});
 
 			var sw = document.createElement("div");
 			sw.className = "swatch";
@@ -663,6 +696,7 @@
 			colorInp.type = "color";
 			colorInp.value = g.color;
 			colorInp.style.flex = "0 0 auto";
+			colorInp.addEventListener("click", function (e) { e.stopPropagation(); });
 			colorInp.addEventListener("input", function () {
 				g.color = colorInp.value;
 				sw.style.background = g.color;
@@ -673,17 +707,9 @@
 			var del = document.createElement("button");
 			del.textContent = "\u2715";
 			del.title = "Delete guild";
-			del.addEventListener("click", function () {
-				var removed = state.guilds.splice(idx, 1)[0];
-				// Detach member towns so they fall back to their own color.
-				state.villages.forEach(function (v) {
-					if (v.guild === removed.name) v.guild = null;
-				});
-				saveGuilds();
-				saveJSON(LS.villages, state.villages);
-				refreshGuildSelect();
-				renderGuilds();
-				draw();
+			del.addEventListener("click", function (e) {
+				e.stopPropagation();
+				removeGuildAt(idx);
 			});
 
 			row.appendChild(sw);
@@ -692,6 +718,33 @@
 			row.appendChild(del);
 			listEl.appendChild(row);
 		});
+	}
+
+	// Remove the guild at the given index, detaching its member towns so they
+	// fall back to their own color.
+	function removeGuildAt(idx) {
+		var removed = state.guilds.splice(idx, 1)[0];
+		if (!removed) return;
+		state.villages.forEach(function (v) {
+			if (v.guild === removed.name) v.guild = null;
+		});
+		if (state.highlightGuild === removed.name) state.highlightGuild = null;
+		saveGuilds();
+		saveJSON(LS.villages, state.villages);
+		refreshGuildSelect();
+		renderGuilds();
+		draw();
+		setStatus("Guild '" + removed.name + "' removed.");
+	}
+
+	// Remove the guild currently selected in the active-guild dropdown.
+	function removeGuild() {
+		var sel = document.getElementById("guildSelect");
+		var name = sel.value;
+		if (!name) { setStatus("Select a guild to remove first."); return; }
+		for (var i = 0; i < state.guilds.length; i++) {
+			if (state.guilds[i].name === name) { removeGuildAt(i); return; }
+		}
 	}
 
 	function addGuild() {
@@ -1201,6 +1254,7 @@
 
 	// Guild controls.
 	document.getElementById("addGuild").addEventListener("click", addGuild);
+	document.getElementById("removeGuild").addEventListener("click", removeGuild);
 	document.getElementById("guildName").addEventListener("keydown", function (e) {
 		if (e.key === "Enter") addGuild();
 	});
