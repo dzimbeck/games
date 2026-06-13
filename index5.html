@@ -517,7 +517,7 @@
 		if (!vs.length) { setStatus("Place some towns first, then assign numbers."); return; }
 
 		var centers = vs.map(townCenter);
-		var K = 6; // up to six nearest neighbours, like the ring around a Catan tile
+		var MAX_NEIGHBORS = 6; // up to six nearest neighbours, like the ring around a Catan tile
 		var neighbors = vs.map(function (_, i) {
 			var d = [];
 			for (var j = 0; j < vs.length; j++) {
@@ -526,7 +526,7 @@
 				d.push({ j: j, dist: dx * dx + dy * dy });
 			}
 			d.sort(function (a, b) { return a.dist - b.dist; });
-			return d.slice(0, K).map(function (o) { return o.j; });
+			return d.slice(0, MAX_NEIGHBORS).map(function (o) { return o.j; });
 		});
 
 		// Clear first so the greedy pass only sees numbers placed this round.
