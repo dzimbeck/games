@@ -163,6 +163,10 @@
 				<button id="removeGuild">Remove guild</button>
 			</div>
 			<div class="group">
+				<button id="assignNumbers" title="Randomly assign Catan dice numbers (2-12, no 7) to all towns; abundance is shown as stars">Assign Catan numbers</button>
+				<button id="toggleNumbers" class="active" title="Show or hide the numbers drawn on the map">Show numbers</button>
+			</div>
+			<div class="group">
 				<button id="clearVillages">Remove all villages</button>
 			</div>
 		</div>
@@ -221,11 +225,12 @@
 		mapData: null, tierData: null, // ImageData for pixel reads
 		biomeLabels: {},            // hex -> name
 		tierLabels: {},             // hex -> name
-		villages: [],               // {cells:[[x,y],...], color, desc, guild}
+		villages: [],               // {cells:[[x,y],...], color, desc, guild, number}
 		guilds: [],                 // {name, color}
 		view: "biome",
 		zoom: 1, offsetX: 0, offsetY: 0,
 		placingManual: false,
+		showNumbers: true,          // draw Catan numbers on the map
 		hoverPx: null,              // {x,y} grid pixel under cursor while placing
 		highlightGuild: null,       // guild name whose towns are circled, or null
 		measuring: false,           // distance measurement mode active
@@ -464,6 +469,7 @@
 		return list.map(function (v) {
 			if (v && Array.isArray(v.cells)) {
 				if (v.guild === undefined) v.guild = null;
+				if (v.number === undefined) v.number = null;
 				return v;
 			}
 			var cells = [];
@@ -472,8 +478,83 @@
 					for (var x = v.x; x < v.x + (v.w || 1); x++) cells.push([x, y]);
 				}
 			}
-			return { cells: cells, color: (v && v.color) || "#ff0000", desc: (v && v.desc) || "", guild: null };
+			return { cells: cells, color: (v && v.color) || "#ff0000", desc: (v && v.desc) || "", guild: null, number: null };
 		}).filter(function (v) { return v.cells.length > 0; });
+	}
+
+	// ---- Catan numbers ----
+	// Valid dice tokens for two six-sided dice, excluding 7 (the robber roll).
+	var CATAN_NUMBERS = [2, 3, 4, 5, 6, 8, 9, 10, 11, 12];
+
+	// Abundance = number of dice combinations that roll a number (1..5):
+	// 2 and 12 -> 1, ..., 6 and 8 -> 5. Shown as that many stars.
+	function abundanceDots(n) { return 6 - Math.abs(7 - n); }
+	function abundanceStars(n) {
+		var s = "", d = abundanceDots(n);
+		for (var i = 0; i < d; i++) s += "\u2605";
+		return s;
+	}
+
+	// Replace (or insert) the auto-managed "Abundance:" line at the top of a
+	// town's description without disturbing the user's own notes below it.
+	var ABUNDANCE_RE = /^Abundance:[^\n]*\n?/;
+	function setAbundanceLine(desc, num) {
+		var rest = (desc || "").replace(ABUNDANCE_RE, "");
+		var line = "Abundance: " + abundanceStars(num) + " (" + num + ")";
+		return rest ? line + "\n" + rest : line;
+	}
+
+	function townCenter(v) {
+		var b = villageBounds(v);
+		return { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+	}
+
+	// Assign each town a random Catan number, avoiding giving the same number to
+	// nearby towns (its closest neighbours, hex-style). Abundance stars are
+	// written into each description.
+	function assignCatanNumbers() {
+		var vs = state.villages;
+		if (!vs.length) { setStatus("Place some towns first, then assign numbers."); return; }
+
+		var centers = vs.map(townCenter);
+		var K = 6; // up to six nearest neighbours, like the ring around a Catan tile
+		var neighbors = vs.map(function (_, i) {
+			var d = [];
+			for (var j = 0; j < vs.length; j++) {
+				if (j === i) continue;
+				var dx = centers[i].x - centers[j].x, dy = centers[i].y - centers[j].y;
+				d.push({ j: j, dist: dx * dx + dy * dy });
+			}
+			d.sort(function (a, b) { return a.dist - b.dist; });
+			return d.slice(0, K).map(function (o) { return o.j; });
+		});
+
+		// Clear first so the greedy pass only sees numbers placed this round.
+		for (var c = 0; c < vs.length; c++) vs[c].number = null;
+
+		// Random processing order for varied layouts.
+		var order = vs.map(function (_, i) { return i; });
+		for (var s = order.length - 1; s > 0; s--) {
+			var r = Math.floor(Math.random() * (s + 1));
+			var tmp = order[s]; order[s] = order[r]; order[r] = tmp;
+		}
+
+		for (var oi = 0; oi < order.length; oi++) {
+			var i = order[oi];
+			var forbidden = {};
+			neighbors[i].forEach(function (j) {
+				if (vs[j].number != null) forbidden[vs[j].number] = true;
+			});
+			var choices = CATAN_NUMBERS.filter(function (n) { return !forbidden[n]; });
+			if (!choices.length) choices = CATAN_NUMBERS; // boxed in: allow a repeat
+			var num = choices[Math.floor(Math.random() * choices.length)];
+			vs[i].number = num;
+			vs[i].desc = setAbundanceLine(vs[i].desc, num);
+		}
+
+		saveJSON(LS.villages, vs);
+		draw();
+		setStatus("Assigned Catan numbers to " + vs.length + " town(s).");
 	}
 
 	// ---- Rendering ----
@@ -533,7 +614,27 @@
 			ctx.stroke();
 		}
 
-		// Highlight: when a guild is selected in the bottom list, ring all of its
+		// Catan numbers, drawn centered on each town (6 and 8 in red, as in Catan).
+		if (state.showNumbers) {
+			ctx.textAlign = "center";
+			ctx.textBaseline = "middle";
+			for (var ni = 0; ni < state.villages.length; ni++) {
+				var nv = state.villages[ni];
+				if (nv.number == null) continue;
+				var nb = villageBounds(nv);
+				var ncx = state.offsetX + (nb.x + nb.w / 2) * state.zoom;
+				var ncy = state.offsetY + (nb.y + nb.h / 2) * state.zoom;
+				var fs = Math.max(10, Math.min(nb.w, nb.h) * state.zoom * 0.8);
+				ctx.font = "bold " + fs + "px sans-serif";
+				ctx.lineWidth = Math.max(2, fs / 6);
+				ctx.strokeStyle = "rgba(0,0,0,0.85)";
+				ctx.strokeText(String(nv.number), ncx, ncy);
+				ctx.fillStyle = (nv.number === 6 || nv.number === 8) ? "#e23b3b" : "#ffffff";
+				ctx.fillText(String(nv.number), ncx, ncy);
+			}
+			ctx.textAlign = "left";
+			ctx.textBaseline = "alphabetic";
+		}
 		// towns with a circle in the guild color so they are easy to spot.
 		if (state.highlightGuild) {
 			var hg = guildByName(state.highlightGuild);
@@ -1004,6 +1105,8 @@
 		popup.innerHTML =
 			'<span class="close" id="popClose">&times;</span>' +
 			'<div><strong>Town</strong> (' + b.x + ', ' + b.y + ') · ' + v.cells.length + ' sq</div>' +
+			'<div><strong>Catan #:</strong> ' +
+				(v.number != null ? v.number + ' ' + abundanceStars(v.number) : '&mdash;') + '</div>' +
 			'<label for="vDesc">Description</label>' +
 			'<textarea id="vDesc" placeholder="guilds, special buildings...">' + escapeHtml(v.desc || "") + '</textarea>' +
 			'<label for="vGuild">Guild</label>' +
@@ -1396,6 +1499,15 @@
 		draw();
 	});
 
+	document.getElementById("assignNumbers").addEventListener("click", assignCatanNumbers);
+
+	document.getElementById("toggleNumbers").addEventListener("click", function () {
+		state.showNumbers = !state.showNumbers;
+		this.classList.toggle("active", state.showNumbers);
+		saveSettings();
+		draw();
+	});
+
 	document.getElementById("clearVillages").addEventListener("click", function () {
 		if (confirm("Remove all placed villages?")) {
 			state.villages = [];
@@ -1500,7 +1612,8 @@
 			width: document.getElementById("vWidth").value,
 			height: document.getElementById("vHeight").value,
 			minDist: document.getElementById("vMinDist").value,
-			count: document.getElementById("vCount").value
+			count: document.getElementById("vCount").value,
+			showNumbers: state.showNumbers
 		});
 	}
 	["vColor", "vWidth", "vHeight", "vMinDist", "vCount"].forEach(function (id) {
@@ -1541,11 +1654,13 @@
 			if (settings.height) document.getElementById("vHeight").value = settings.height;
 			if (settings.minDist != null) document.getElementById("vMinDist").value = settings.minDist;
 			if (settings.count) document.getElementById("vCount").value = settings.count;
+			if (settings.showNumbers != null) state.showNumbers = settings.showNumbers;
 		} else {
 			// Default to a random color, saved for next time.
 			document.getElementById("vColor").value = randomColor();
 			saveSettings();
 		}
+		document.getElementById("toggleNumbers").classList.toggle("active", state.showNumbers);
 
 		// Restore saved images from IndexedDB, migrating any legacy
 		// localStorage-stored images on the way.
