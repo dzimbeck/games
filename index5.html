@@ -163,10 +163,6 @@
 				<button id="removeGuild">Remove guild</button>
 			</div>
 			<div class="group">
-				<button id="assignNumbers" title="Assign Catan dice numbers (2-12, no 7) so no two neighbouring grid cells share a number">Assign Catan numbers</button>
-				<button id="toggleNumbers" class="active" title="Show or hide the numbers drawn on the map">Show numbers</button>
-			</div>
-			<div class="group">
 				<button id="clearVillages">Remove all villages</button>
 			</div>
 		</div>
@@ -225,22 +221,18 @@
 		mapData: null, tierData: null, // ImageData for pixel reads
 		biomeLabels: {},            // hex -> name
 		tierLabels: {},             // hex -> name
-		villages: [],               // {cells:[[x,y],...], color, desc, guild, number}
+		villages: [],               // {cells:[[x,y],...], color, desc, guild}
 		guilds: [],                 // {name, color}
+		numbers: [],
 		view: "biome",
 		zoom: 1, offsetX: 0, offsetY: 0,
 		placingManual: false,
-		showNumbers: true,          // draw Catan numbers on the map
 		hoverPx: null,              // {x,y} grid pixel under cursor while placing
 		highlightGuild: null,       // guild name whose towns are circled, or null
 		measuring: false,           // distance measurement mode active
 		measurePoints: [],          // [{x,y},...] polyline vertices in grid units (1 unit = 20 m)
 		measureHover: null          // {x,y} grid point under cursor while measuring
 	};
-
-	// Catan numbers, distinct from each 8-neighbour, assigned to the whole map
-	// grid by placeNumbers(). numberGrid[y][x] holds a number or null.
-	var numberGrid = null;
 
 	var viewport = document.getElementById("mapViewport");
 	var canvas = document.getElementById("mapCanvas");
@@ -473,7 +465,6 @@
 		return list.map(function (v) {
 			if (v && Array.isArray(v.cells)) {
 				if (v.guild === undefined) v.guild = null;
-				if (v.number === undefined) v.number = null;
 				return v;
 			}
 			var cells = [];
@@ -482,85 +473,8 @@
 					for (var x = v.x; x < v.x + (v.w || 1); x++) cells.push([x, y]);
 				}
 			}
-			return { cells: cells, color: (v && v.color) || "#ff0000", desc: (v && v.desc) || "", guild: null, number: null };
+			return { cells: cells, color: (v && v.color) || "#ff0000", desc: (v && v.desc) || "", guild: null };
 		}).filter(function (v) { return v.cells.length > 0; });
-	}
-
-	// ---- Catan numbers ----
-	// Valid dice tokens for two six-sided dice, excluding 7 (the robber roll).
-	var CATAN_NUMBERS = [2, 3, 4, 5, 6, 8, 9, 10, 11, 12];
-
-	// Abundance = number of dice combinations that roll a number (1..5):
-	// 2 and 12 -> 1, ..., 6 and 8 -> 5. Shown as that many stars in the popup.
-	function abundanceDots(n) { return 6 - Math.abs(7 - n); }
-	function abundanceStars(n) {
-		var s = "", d = abundanceDots(n);
-		for (var i = 0; i < d; i++) s += "\u2605";
-		return s;
-	}
-
-	// Fill numberGrid[y][x] for the whole map with Catan numbers so that no cell
-	// shares a number with any of its eight neighbours. Scanning in raster order
-	// only ever forbids the (at most four) already-filled neighbours, leaving at
-	// least six choices, so a valid number is always available.
-	function placeNumbers() {
-		var validNumbers = CATAN_NUMBERS;
-		numberGrid = [];
-		for (var y = 0; y < state.H; y++) {
-			var row = [];
-			for (var x = 0; x < state.W; x++) row.push(null);
-			numberGrid.push(row);
-		}
-		var neigh8 = [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]];
-		for (var y = 0; y < state.H; y++) {
-			for (var x = 0; x < state.W; x++) {
-				var forbidden = {};
-				for (var n = 0; n < neigh8.length; n++) {
-					var nx = x + neigh8[n][0], ny = y + neigh8[n][1];
-					if (nx >= 0 && nx < state.W && ny >= 0 && ny < state.H) {
-						var val = numberGrid[ny][nx];
-						if (val != null) forbidden[val] = true;
-					}
-				}
-				var choices = validNumbers.filter(function (v) { return !forbidden[v]; });
-				// Raster order only forbids the <=4 already-filled neighbours, so
-				// at least six choices always remain; the fallback is just defensive.
-				if (!choices.length) choices = validNumbers;
-				numberGrid[y][x] = choices[Math.floor(Math.random() * choices.length)];
-			}
-		}
-	}
-
-	// The cell of a town closest to its centroid, used as the town's anchor when
-	// reading its number from numberGrid.
-	function townAnchorCell(v) {
-		var sx = 0, sy = 0;
-		for (var i = 0; i < v.cells.length; i++) { sx += v.cells[i][0]; sy += v.cells[i][1]; }
-		var cx = sx / v.cells.length, cy = sy / v.cells.length;
-		var best = v.cells[0], bestD = Infinity;
-		for (var j = 0; j < v.cells.length; j++) {
-			var dx = v.cells[j][0] - cx, dy = v.cells[j][1] - cy;
-			var d = dx * dx + dy * dy;
-			if (d < bestD) { bestD = d; best = v.cells[j]; }
-		}
-		return best;
-	}
-
-	// Build the number grid, then give each town the number under its anchor
-	// cell. Because neighbouring grid cells always differ, towns whose cells
-	// touch receive different numbers.
-	function assignCatanNumbers() {
-		if (!state.W) { setStatus("Load a map first, then assign numbers."); return; }
-		var vs = state.villages;
-		if (!vs.length) { setStatus("Place some towns first, then assign numbers."); return; }
-		placeNumbers();
-		for (var i = 0; i < vs.length; i++) {
-			var a = townAnchorCell(vs[i]);
-			vs[i].number = numberGrid[a[1]][a[0]];
-		}
-		saveJSON(LS.villages, vs);
-		draw();
-		setStatus("Assigned Catan numbers to " + vs.length + " town(s).");
 	}
 
 	// ---- Rendering ----
@@ -618,28 +532,6 @@
 				if (!set[cellKey(x + 1, y)]) { ctx.moveTo(px + z, py); ctx.lineTo(px + z, py + z); }
 			}
 			ctx.stroke();
-		}
-
-		// Catan numbers, drawn centered on each town (6 and 8 in red, as in Catan).
-		if (state.showNumbers) {
-			ctx.textAlign = "center";
-			ctx.textBaseline = "middle";
-			for (var ni = 0; ni < state.villages.length; ni++) {
-				var nv = state.villages[ni];
-				if (nv.number == null) continue;
-				var nb = villageBounds(nv);
-				var ncx = state.offsetX + (nb.x + nb.w / 2) * state.zoom;
-				var ncy = state.offsetY + (nb.y + nb.h / 2) * state.zoom;
-				var fs = Math.max(10, Math.min(nb.w, nb.h) * state.zoom * 0.8);
-				ctx.font = "bold " + fs + "px sans-serif";
-				ctx.lineWidth = Math.max(2, fs / 6);
-				ctx.strokeStyle = "rgba(0,0,0,0.85)";
-				ctx.strokeText(String(nv.number), ncx, ncy);
-				ctx.fillStyle = (nv.number === 6 || nv.number === 8) ? "#e23b3b" : "#ffffff";
-				ctx.fillText(String(nv.number), ncx, ncy);
-			}
-			ctx.textAlign = "left";
-			ctx.textBaseline = "alphabetic";
 		}
 
 		// Highlight: when a guild is selected in the bottom list, ring all of its
@@ -1022,6 +914,32 @@
 		return true;
 	}
 
+	function placeNumbers() {
+		var validNumbers = [2,3,4,5,6,8,9,10,11,12];
+		numberGrid = [];
+		for (var y = 0; y < state.H; y++) {
+			var row = [];
+			for (var x = 0; x < state.W; x++) row.push(null);
+			numberGrid.push(row);
+		}
+		var neigh8 = [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]];
+		for (var y = 0; y < state.H; y++) {
+			for (var x = 0; x < state.W; x++) {
+				var forbidden = {};
+				for (var n = 0; n < neigh8.length; n++) {
+					var nx = x + neigh8[n][0], ny = y + neigh8[n][1];
+					if (nx>=0 && nx<state.W && ny>=0 && ny<state.H && numberGrid[ny][nx] != null) {
+						forbidden[numberGrid[ny][nx]] = true;
+					}
+				}
+				var candidates = validNumbers.filter(function(v){ return !forbidden[v]; });
+				if (candidates.length === 0) candidates = validNumbers.slice(); // safety: with 10 valid numbers and only 4 already-placed neighbors (NW, N, NE, W) in row-major order, this is unreachable
+				numberGrid[y][x] = candidates[Math.floor(Math.random() * candidates.length)];
+			}
+		}
+		state.numbers = numberGrid;
+	}
+
 	function placeRandomVillages() {
 		if (!state.mapData || !state.tierData) {
 			setStatus("Load both the map and the tiers image first.");
@@ -1091,11 +1009,13 @@
 	function showInfoPopup(gridPt, clientX, clientY) {
 		var bName = biomeName(colorAt(state.mapData, gridPt.x, gridPt.y)) || "(unlabeled)";
 		var tName = tierName(colorAt(state.tierData, gridPt.x, gridPt.y)) || "(unlabeled)";
+		var nName = "Number goes here with stars ***..."
 		popup.innerHTML =
 			'<span class="close" id="popClose">&times;</span>' +
 			'<div><strong>Square</strong> (' + gridPt.x + ', ' + gridPt.y + ')</div>' +
 			'<div><strong>Biome:</strong> ' + escapeHtml(bName) + '</div>' +
-			'<div><strong>Tier:</strong> ' + escapeHtml(tName) + '</div>';
+			'<div><strong>Tier:</strong> ' + escapeHtml(tName) + '</div>' +
+			'<div><strong>Abundance:</strong> ' + escapeHtml(nName) + '</div>';
 		positionPopup(clientX, clientY);
 		popup.classList.add("show");
 		document.getElementById("popClose").onclick = hidePopup;
@@ -1113,8 +1033,6 @@
 		popup.innerHTML =
 			'<span class="close" id="popClose">&times;</span>' +
 			'<div><strong>Town</strong> (' + b.x + ', ' + b.y + ') · ' + v.cells.length + ' sq</div>' +
-			'<div><strong>Catan #:</strong> ' +
-				(v.number != null ? v.number + ' ' + abundanceStars(v.number) : '&mdash;') + '</div>' +
 			'<label for="vDesc">Description</label>' +
 			'<textarea id="vDesc" placeholder="guilds, special buildings...">' + escapeHtml(v.desc || "") + '</textarea>' +
 			'<label for="vGuild">Guild</label>' +
@@ -1507,15 +1425,6 @@
 		draw();
 	});
 
-	document.getElementById("assignNumbers").addEventListener("click", assignCatanNumbers);
-
-	document.getElementById("toggleNumbers").addEventListener("click", function () {
-		state.showNumbers = !state.showNumbers;
-		this.classList.toggle("active", state.showNumbers);
-		saveSettings();
-		draw();
-	});
-
 	document.getElementById("clearVillages").addEventListener("click", function () {
 		if (confirm("Remove all placed villages?")) {
 			state.villages = [];
@@ -1620,8 +1529,7 @@
 			width: document.getElementById("vWidth").value,
 			height: document.getElementById("vHeight").value,
 			minDist: document.getElementById("vMinDist").value,
-			count: document.getElementById("vCount").value,
-			showNumbers: state.showNumbers
+			count: document.getElementById("vCount").value
 		});
 	}
 	["vColor", "vWidth", "vHeight", "vMinDist", "vCount"].forEach(function (id) {
@@ -1662,13 +1570,11 @@
 			if (settings.height) document.getElementById("vHeight").value = settings.height;
 			if (settings.minDist != null) document.getElementById("vMinDist").value = settings.minDist;
 			if (settings.count) document.getElementById("vCount").value = settings.count;
-			if (settings.showNumbers != null) state.showNumbers = settings.showNumbers;
 		} else {
 			// Default to a random color, saved for next time.
 			document.getElementById("vColor").value = randomColor();
 			saveSettings();
 		}
-		document.getElementById("toggleNumbers").classList.toggle("active", state.showNumbers);
 
 		// Restore saved images from IndexedDB, migrating any legacy
 		// localStorage-stored images on the way.
