@@ -523,7 +523,9 @@
 					}
 				}
 				var choices = validNumbers.filter(function (v) { return !forbidden[v]; });
-				if (!choices.length) choices = validNumbers; // never expected, but safe
+				// Raster order only forbids the <=4 already-filled neighbours, so
+				// at least six choices always remain; the fallback is just defensive.
+				if (!choices.length) choices = validNumbers;
 				numberGrid[y][x] = choices[Math.floor(Math.random() * choices.length)];
 			}
 		}
